@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 # Create the FrozenLake environment (deterministic version for initial setup)
 # env = gym.make('FrozenLake-v1', is_slippery=False, render_mode='ansi')
-env = gym.make('FrozenLake-v1', map_name="4x4", is_slippery=True, render_mode='ansi') 
+env = gym.make('FrozenLake-v1', map_name="4x4", is_slippery=False, render_mode='ansi') 
 
 # Get environment information
 state_space_size = env.observation_space.n  # 16 states (0-15)
@@ -304,10 +304,10 @@ print("S = Start, F = Frozen, H = Hole, G = Goal")
 print("Arrows show best action from each state:\n")
 
 map_grid = [
-    ['S', 'F', 'F', 'F'],
-    ['F', 'H', 'F', 'H'],
-    ['F', 'F', 'F', 'H'],
-    ['H', 'F', 'F', 'G']
+    ['S', 'H', 'G', 'H'],
+    ['F', 'H', 'F', 'F'],
+    ['F', 'H', 'H', 'F'],
+    ['F', 'F', 'F', 'F']
 ]
 
 for row in range(4):
