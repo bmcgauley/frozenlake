@@ -1,29 +1,38 @@
 """
-LAGUNA SECA SATELLITE Q-LEARNING - FIXED COLOR DETECTION
+LAGUNA SECA RACING - FEEDFORWARD DQN WITH GLOBAL VIEW
 
-CRITICAL FIX: Satellite track is DARK BLUE/GRAY, not black
-Track detection uses proper color ranges for satellite imagery
-Random start position ensures starting ON track
-Circuit-based goals with lap counting
+Uses simple feedforward network with expanded state representation:
+- Agent's global position and velocity
+- All checkpoint locations and distances
+- Finish line location
+- Much faster training than CNN approach
 """
 
 import numpy as np
 import time
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 from PIL import Image
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import random
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-TRAINING_IMAGE = 'img/laguna_seca.jpg'  # Satellite image
+TRAINING_IMAGE = 'img/laguna_seca.jpg'
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print("=" * 70)
-print("LAGUNA SECA Q-LEARNING - SATELLITE TRACK")
+print("LAGUNA SECA FEEDFORWARD DQN")
+print(f"Device: {DEVICE}")
 print("=" * 70)
 
 # ============================================================================
-# STEP 1: LOAD IMAGE
+# LOAD AND PROCESS IMAGE
 # ============================================================================
 if not os.path.exists(TRAINING_IMAGE):
     print(f"\nERROR: Image not found: {TRAINING_IMAGE}")
@@ -37,74 +46,44 @@ img_array = np.array(img)
 height, width = img_array.shape[0], img_array.shape[1]
 total_pixels = height * width
 
-print(f"Full resolution: {width}x{height} = {total_pixels:,} pixels")
+print(f"Resolution: {width}x{height} = {total_pixels:,} pixels")
 
 # ============================================================================
-# STEP 2: ANALYZE COLOR DISTRIBUTION (DEBUG)
+# COLOR DETECTION
 # ============================================================================
-print("\nAnalyzing pixel colors...")
-
-# Sample pixels to understand color distribution
-sample_pixels = img_array[::10, ::10].reshape(-1, 3)
-print(f"Sampled {len(sample_pixels)} pixels for analysis")
-print(f"R range: {sample_pixels[:, 0].min()}-{sample_pixels[:, 0].max()}")
-print(f"G range: {sample_pixels[:, 1].min()}-{sample_pixels[:, 1].max()}")
-print(f"B range: {sample_pixels[:, 2].min()}-{sample_pixels[:, 2].max()}")
-
-# ============================================================================
-# STEP 3: IMPROVED COLOR DETECTION FOR SATELLITE
-# ============================================================================
-print("\nProcessing pixels with satellite-specific detection...")
+print("\nDetecting color-coded elements...")
 
 track_map = []
-track_positions = []  # Store all valid track positions
+track_positions = []
+start_positions = []
+finish_positions = []
+checkpoint_positions = []
 
 for row in range(height):
     track_row = []
     for col in range(width):
         r, g, b = img_array[row, col]
         
-        # SATELLITE IMAGE COLOR DETECTION - REFINED
-        
-        # Dark blue/gray = Track asphalt (the actual racing surface)
-        # Based on satellite imagery, track is darker with blue/gray tint
-        if (50 <= r <= 130 and 60 <= g <= 140 and 70 <= b <= 150):
+        if g > 200 and r < 50 and b < 50:
+            cell = 'S'
+            track_positions.append((row, col))
+            start_positions.append((row, col))
+        elif r > 200 and g < 50 and b < 50:
+            cell = 'F'
+            track_positions.append((row, col))
+            finish_positions.append((row, col))
+        elif b > 200 and r < 50 and g < 50:
+            cell = 'C'
+            track_positions.append((row, col))
+            checkpoint_positions.append((row, col))
+        elif (int(r) + int(g) + int(b)) / 3 < 100:
             cell = 'T'
             track_positions.append((row, col))
-        
-        # Tan/beige = Runoff areas (also drivable)
-        elif (140 <= r <= 220 and 130 <= g <= 200 and 90 <= b <= 160):
-            cell = 'T'
-            track_positions.append((row, col))
-        
-        # Medium gray = Track borders (drivable)
-        elif (80 <= r <= 160 and 90 <= g <= 170 and 100 <= b <= 180):
-            cell = 'T'
-            track_positions.append((row, col))
-        
-        # Green vegetation = Out of bounds
-        elif g > r + 20 and g > b + 10 and g > 80:
+        elif (int(r) + int(g) + int(b)) / 3 > 200:
             cell = '#'
-        
-        # Very dark = Shadows/barriers
-        elif r < 50 and g < 50 and b < 50:
-            cell = '#'
-        
-        # Very bright = Buildings/non-track
-        elif r > 200 and g > 200 and b > 200:
-            cell = '#'
-        
-        # Brown/dirt = Out of bounds
-        elif r > 140 and g > 100 and b < 100 and r > g + 20:
-            cell = '#'
-        
-        # Default to track for medium tones
-        elif 60 <= r <= 200 and 70 <= g <= 200 and 80 <= b <= 200:
-            cell = 'T'
-            track_positions.append((row, col))
-        
         else:
-            cell = '#'
+            cell = 'T'
+            track_positions.append((row, col))
         
         track_row.append(cell)
     
@@ -113,310 +92,475 @@ for row in range(height):
     
     track_map.append(track_row)
 
-# Calculate statistics
 track_cells = len(track_positions)
-wall_cells = total_pixels - track_cells
-track_percentage = (track_cells / total_pixels) * 100
+print(f"\nDetection Results:")
+print(f"Track: {track_cells:,} pixels ({track_cells/total_pixels*100:.1f}%)")
+print(f"Start: {len(start_positions)} pixels")
+print(f"Finish: {len(finish_positions)} pixels")
+print(f"Checkpoints: {len(checkpoint_positions)} pixels")
 
-print(f"\nDETECTION RESULTS:")
-print(f"Track cells: {track_cells:,} ({track_percentage:.1f}%)")
-print(f"Wall/OOB cells: {wall_cells:,} ({100-track_percentage:.1f}%)")
-
-if track_cells == 0:
-    print("\nERROR: No track detected! Color detection failed.")
-    print("Showing sample of what was detected:")
-    for row in range(min(20, height)):
-        print("".join(track_map[row][:min(50, width)]))
-    exit(1)
-
-# ============================================================================
-# STEP 4: RANDOM START POSITION ON TRACK
-# ============================================================================
-print("\nSelecting random start position...")
-
-# Pick random track position
-start_idx = np.random.randint(0, len(track_positions))
-start_row, start_col = track_positions[start_idx]
-
-# Mark as start
-track_map[start_row][start_col] = 'S'
-
-# Pick finish line (different random position, far from start)
-finish_idx = np.random.randint(0, len(track_positions))
-while abs(track_positions[finish_idx][0] - start_row) < height // 4:
-    finish_idx = np.random.randint(0, len(track_positions))
-
-finish_row, finish_col = track_positions[finish_idx]
-track_map[finish_row][finish_col] = 'F'
+# Set start/finish
+start_row = int(np.mean([p[0] for p in start_positions]))
+start_col = int(np.mean([p[1] for p in start_positions]))
+finish_row = int(np.mean([p[0] for p in finish_positions]))
+finish_col = int(np.mean([p[1] for p in finish_positions]))
 
 print(f"Start: ({start_row}, {start_col})")
 print(f"Finish: ({finish_row}, {finish_col})")
 
-# Verify start is not on wall
-if track_map[start_row][start_col] not in ['S', 'T', 'F']:
-    print("ERROR: Start position is on wall!")
-    exit(1)
+# Group checkpoints
+checkpoint_regions = []
+used = set()
+for cp_row, cp_col in checkpoint_positions:
+    if (cp_row, cp_col) in used:
+        continue
+    region = [(cp_row, cp_col)]
+    used.add((cp_row, cp_col))
+    for other_row, other_col in checkpoint_positions:
+        if (other_row, other_col) in used:
+            continue
+        if np.sqrt((cp_row-other_row)**2 + (cp_col-other_col)**2) < 50:
+            region.append((other_row, other_col))
+            used.add((other_row, other_col))
+    center = (int(np.mean([p[0] for p in region])), int(np.mean([p[1] for p in region])))
+    checkpoint_regions.append({'center': center, 'positions': region, 'size': len(region)})
 
-# Show sample
-print("\nMAP SAMPLE (around start position):")
-sample_row_start = max(0, start_row - 100)
-sample_row_end = min(height, start_row + 100)
-sample_col_start = max(0, start_col - 100)
-sample_col_end = min(width, start_col + 100)
-
-for row in range(sample_row_start, sample_row_end):
-    print("".join(track_map[row][sample_col_start:sample_col_end]))
-
-# ============================================================================
-# STEP 5: ENVIRONMENT SETUP
-# ============================================================================
-num_rows = height
-num_cols = width
-
-SLOW = 0
-MEDIUM = 1
-FAST = 2
-num_velocity_levels = 3
-
-state_space_size = num_rows * num_cols * num_velocity_levels
-
-ACCELERATE = 0
-COAST = 1
-BRAKE = 2
-TURN_LEFT = 3
-TURN_RIGHT = 4
-action_space_size = 5
-
-print(f"\nENVIRONMENT:")
-print(f"State space: {state_space_size:,} states")
-print(f"Q-table size: {state_space_size * action_space_size * 4 / 1_000_000:.1f} MB")
+print(f"Checkpoint regions: {len(checkpoint_regions)}")
+for i, region in enumerate(checkpoint_regions):
+    print(f"  Region {i+1}: {region['center']}, {region['size']} pixels")
 
 # ============================================================================
-# STEP 6: STATE ENCODING
+# VISUALIZATION
 # ============================================================================
-def encode_state(row, col, velocity):
-    return (row * num_cols * num_velocity_levels) + (col * num_velocity_levels) + velocity
+print("\n" + "=" * 70)
+print("INITIAL TRACK VISUALIZATION")
+print("=" * 70)
 
-def decode_state(state_id):
-    velocity = state_id % num_velocity_levels
-    remaining = state_id // num_velocity_levels
-    col = remaining % num_cols
-    row = remaining // num_cols
-    return row, col, velocity
+map_colors = np.zeros((height, width, 3))
+text_grid = []
+
+for row in range(height):
+    text_row = []
+    for col in range(width):
+        cell = track_map[row][col]
+        if cell == 'T':
+            map_colors[row, col] = [0.3, 0.3, 0.3]
+            text_row.append('T')
+        elif cell == '#':
+            map_colors[row, col] = [0.95, 0.95, 0.95]
+            text_row.append('#')
+        elif cell == 'S':
+            map_colors[row, col] = [0.0, 0.9, 0.0]
+            text_row.append('S')
+        elif cell == 'F':
+            map_colors[row, col] = [0.9, 0.0, 0.0]
+            text_row.append('F')
+        elif cell == 'C':
+            map_colors[row, col] = [0.0, 0.0, 0.9]
+            text_row.append('C')
+    text_grid.append(text_row)
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+axes[0].imshow(map_colors)
+axes[0].set_title('Detected Track (Color-Coded)', fontsize=14, fontweight='bold')
+axes[0].axis('off')
+
+text_img = map_colors.copy()
+axes[1].imshow(text_img)
+axes[1].set_title('Grid Representation (T=Track, #=Wall, S=Start, F=Finish, C=Checkpoint)', 
+                  fontsize=12, fontweight='bold')
+axes[1].axis('off')
+
+plt.tight_layout()
+plt.savefig('track_initial_detection.png', dpi=150, bbox_inches='tight')
+print("Saved: track_initial_detection.png")
+plt.show()
 
 # ============================================================================
-# STEP 7: ENVIRONMENT DYNAMICS
+# FEEDFORWARD DQN NETWORK
 # ============================================================================
-def step(current_state, action, laps_completed):
-    row, col, velocity = decode_state(current_state)
-    
-    new_velocity = velocity
-    if action == ACCELERATE:
-        new_velocity = min(FAST, velocity + 1)
-    elif action == BRAKE:
-        new_velocity = max(SLOW, velocity - 1)
-    
-    # Movement based on action
-    if action in [ACCELERATE, COAST, BRAKE]:
-        row_change = -1 if new_velocity == SLOW else -2
-        col_change = 0
-    elif action == TURN_LEFT:
-        row_change = -1 if new_velocity == SLOW else -2
-        col_change = -1
-    elif action == TURN_RIGHT:
-        row_change = -1 if new_velocity == SLOW else -2
-        col_change = 1
-    
-    new_row = row + row_change
-    new_col = col + col_change
-    
-    # Boundary check
-    if new_row < 0 or new_row >= num_rows or new_col < 0 or new_col >= num_cols:
-        reward = -100
-        done = True
-        new_row = start_row
-        new_col = start_col
-        new_velocity = SLOW
-        laps_completed = 0
-    else:
-        cell_type = track_map[new_row][new_col]
-        done = False
+class FeedForwardDQN(nn.Module):
+    def __init__(self, input_size, num_actions):
+        super(FeedForwardDQN, self).__init__()
         
-        if cell_type == '#':
-            # Hit wall
-            reward = -100
+        self.network = nn.Sequential(
+            nn.Linear(input_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_actions)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+# ============================================================================
+# REPLAY BUFFER
+# ============================================================================
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+    
+    def __len__(self):
+        return len(self.buffer)
+
+# ============================================================================
+# ENVIRONMENT WITH GLOBAL STATE
+# ============================================================================
+class RacingEnv:
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.row = start_row
+        self.col = start_col
+        self.velocity = 0.0
+        self.visited_checkpoints = set()
+        self.total_steps = 0
+        return self.get_state()
+    
+    def get_state(self):
+        """
+        Global state representation with full visibility:
+        - Normalized position (x, y)
+        - Normalized velocity
+        - Distance to each checkpoint (normalized)
+        - Which checkpoints are visited (binary flags)
+        - Distance to finish (normalized)
+        - Direction vector to nearest unvisited checkpoint
+        """
+        state = []
+        
+        # Agent position (normalized to 0-1)
+        state.append(self.row / height)
+        state.append(self.col / width)
+        
+        # Velocity (normalized to 0-1)
+        state.append(self.velocity / 100.0)
+        
+        # Distance and direction to each checkpoint
+        for i, region in enumerate(checkpoint_regions):
+            cp_row, cp_col = region['center']
+            
+            # Distance (normalized)
+            distance = np.sqrt((self.row - cp_row)**2 + (self.col - cp_col)**2)
+            norm_distance = distance / np.sqrt(height**2 + width**2)
+            state.append(norm_distance)
+            
+            # Direction vector (normalized)
+            if distance > 0:
+                state.append((cp_row - self.row) / distance)
+                state.append((cp_col - self.col) / distance)
+            else:
+                state.append(0.0)
+                state.append(0.0)
+            
+            # Visited flag
+            state.append(1.0 if i in self.visited_checkpoints else 0.0)
+        
+        # Distance and direction to finish
+        finish_distance = np.sqrt((self.row - finish_row)**2 + (self.col - finish_col)**2)
+        norm_finish_distance = finish_distance / np.sqrt(height**2 + width**2)
+        state.append(norm_finish_distance)
+        
+        if finish_distance > 0:
+            state.append((finish_row - self.row) / finish_distance)
+            state.append((finish_col - self.col) / finish_distance)
+        else:
+            state.append(0.0)
+            state.append(0.0)
+        
+        return torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
+    
+    def step(self, action):
+        # Action mapping: 0=Accel, 1=Coast, 2=Brake, 3=TurnLeft, 4=TurnRight
+        if action == 0:
+            self.velocity = min(100.0, self.velocity + 15.0)
+            row_change, col_change = -2, 0
+        elif action == 1:
+            self.velocity = max(0.0, self.velocity - 2.0)
+            row_change, col_change = -1, 0
+        elif action == 2:
+            self.velocity = max(0.0, self.velocity - 25.0)
+            row_change, col_change = -1, 0
+        elif action == 3:
+            row_change, col_change = -1, -1
+        elif action == 4:
+            row_change, col_change = -1, 1
+        
+        prev_row, prev_col = self.row, self.col
+        new_row = self.row + row_change
+        new_col = self.col + col_change
+        self.total_steps += 1
+        
+        # Bounds check
+        if new_row < 0 or new_row >= height or new_col < 0 or new_col >= width:
+            reward = -100.0
             done = True
-            new_row = start_row
-            new_col = start_col
-            new_velocity = SLOW
-            laps_completed = 0
+            self.reset()
+            return self.get_state(), reward, done, {'crash': True}
         
-        elif cell_type == 'F':
-            # Crossed finish
-            reward = 1000
-            laps_completed += 1
-            done = False
+        cell = track_map[new_row][new_col]
+        done = False
+        info = {}
         
-        elif cell_type in ['T', 'S']:
-            # On track
-            cells_moved = abs(row_change) + abs(col_change)
-            reward = cells_moved * 1.0
+        # SPARSE REWARD STRUCTURE - Only reward achievements
+        
+        if cell == '#':
+            # Wall crash
+            reward = -100.0
+            done = True
+            self.reset()
+            return self.get_state(), reward, done, {'crash': True}
+        
+        elif cell == 'F':
+            # Finish line
+            min_checkpoints = max(1, len(checkpoint_regions) - 1)
+            if len(self.visited_checkpoints) < min_checkpoints:
+                # Finish without checkpoints - massive penalty
+                reward = -100.0
+                done = True
+                info['finish_blocked'] = True
+                if np.random.random() < 0.02:
+                    print(f"  Finish blocked: {len(self.visited_checkpoints)}/{min_checkpoints} CP")
+                self.reset()
+            else:
+                # SUCCESS - huge reward
+                reward = 50.0 + len(self.visited_checkpoints) * 500.0
+                done = True
+                info['success'] = True
+                print(f"  *** SUCCESS! Steps: {self.total_steps}, CP: {len(self.visited_checkpoints)} ***")
+                self.reset()
+        
+        elif cell == 'C':
+            # Checkpoint collection
+            current_cp = None
+            for i, region in enumerate(checkpoint_regions):
+                for cp_row, cp_col in region['positions']:
+                    if new_row == cp_row and new_col == cp_col:
+                        current_cp = i
+                        break
+            
+            if current_cp is not None and current_cp not in self.visited_checkpoints:
+                # First time collecting this checkpoint - HUGE reward
+                reward = 2000.0
+                self.visited_checkpoints.add(current_cp)
+                info['checkpoint'] = current_cp
+                print(f"  ✓ Checkpoint {current_cp+1}/{len(checkpoint_regions)} collected!")
+            else:
+                # Already visited or not a checkpoint - zero reward
+                reward = 0.0
         
         else:
-            # Off track
-            cells_moved = abs(row_change) + abs(col_change)
-            reward = cells_moved * -5.0
-    
-    next_state = encode_state(new_row, new_col, new_velocity)
-    return next_state, reward, done, laps_completed
-
-def reset_environment():
-    return encode_state(start_row, start_col, SLOW)
-
-# ============================================================================
-# STEP 8: Q-TABLE
-# ============================================================================
-print("\nInitializing Q-table...")
-q_table = np.zeros((state_space_size, action_space_size), dtype=np.float32)
-print(f"Memory: {q_table.nbytes / 1_000_000:.1f} MB")
+            # Normal track movement - ZERO reward
+            # Agent must find checkpoints through exploration, not gradient following
+            reward = 0.0
+        
+        self.row = new_row
+        self.col = new_col
+        
+        return self.get_state(), reward, done, info
 
 # ============================================================================
-# STEP 9: HYPERPARAMETERS
+# TRAINING SETUP
 # ============================================================================
-alpha = 0.01
-gamma = 0.95
+print("\n" + "=" * 70)
+print("FEEDFORWARD DQN SETUP")
+print("=" * 70)
+
+env = RacingEnv()
+num_actions = 5
+
+# Calculate state size
+# Position(2) + Velocity(1) + Per_Checkpoint[Distance(1) + Direction(2) + Visited(1)] + Finish[Distance(1) + Direction(2)]
+state_size = 3 + len(checkpoint_regions) * 4 + 3
+print(f"State size: {state_size} features")
+
+policy_net = FeedForwardDQN(state_size, num_actions).to(DEVICE)
+target_net = FeedForwardDQN(state_size, num_actions).to(DEVICE)
+target_net.load_state_dict(policy_net.state_dict())
+target_net.eval()
+
+optimizer = optim.Adam(policy_net.parameters(), lr=0.001)
+replay_buffer = ReplayBuffer(50000)
+
+# Hyperparameters
+batch_size = 128
+gamma = 0.99
 epsilon_start = 1.0
-epsilon_min = 0.01
-epsilon_decay = 0.9995
-num_episodes = 1000000
-max_steps_per_episode = 10000
+epsilon_end = 0.1
+epsilon_decay = 0.9999  # Much slower decay - maintains exploration
+target_update = 100
+num_episodes = 10000  # More episodes for sparse rewards
 
+print(f"Network parameters: {sum(p.numel() for p in policy_net.parameters()):,}")
+print(f"Replay buffer: 50,000")
+print(f"Episodes: {num_episodes}")
+
+# ============================================================================
+# TRAINING
+# ============================================================================
 print("\n" + "=" * 70)
 print("TRAINING")
 print("=" * 70)
-
-# ============================================================================
-# STEP 10: TRAINING
-# ============================================================================
-rewards_per_episode = []
-laps_per_episode = []
-epsilon_values = []
+print("SPARSE REWARD STRUCTURE:")
+print("- Normal track movement: 0 reward")
+print("- Checkpoint collection: +2000")
+print("- Finish (with checkpoints): +5000 + 500 per checkpoint")
+print("- Crash/OOB: -100")
+print("- Finish blocked: -1000")
+print("\nAgent MUST explore to find rewards (high epsilon maintained)")
+print("Starting...\n")
 
 epsilon = epsilon_start
+rewards_per_episode = []
+checkpoints_per_episode = []
+epsilon_values = []
+
+milestone_paths = {}
+milestones = [100, 500, 1000, 2500, 4999]
+
 start_time = time.time()
 
 for episode in range(num_episodes):
-    state = reset_environment()
+    state = env.reset()
     total_reward = 0
-    laps_completed = 0
     done = False
     steps = 0
+    path = []
     
-    while not done and steps < max_steps_per_episode:
-        if np.random.random() < epsilon:
-            action = np.random.randint(0, action_space_size)
+    while not done and steps < 2000:
+        if random.random() < epsilon:
+            action = random.randint(0, num_actions - 1)
         else:
-            action = np.argmax(q_table[state, :])
+            with torch.no_grad():
+                action = policy_net(state).max(1)[1].item()
         
-        next_state, reward, done, laps_completed = step(state, action, laps_completed)
+        path.append((env.row, env.col, env.velocity))
         
-        current_q = q_table[state, action]
-        max_future_q = np.max(q_table[next_state, :])
-        new_q = current_q + alpha * (reward + gamma * max_future_q - current_q)
-        q_table[state, action] = new_q
+        next_state, reward, done, info = env.step(action)
+        total_reward += reward
+        
+        replay_buffer.push(state, action, reward, next_state, done)
         
         state = next_state
-        total_reward += reward
         steps += 1
+        
+        # Train
+        if len(replay_buffer) >= batch_size:
+            batch = replay_buffer.sample(batch_size)
+            states, actions, rewards, next_states, dones = zip(*batch)
+            
+            states = torch.cat(states)
+            actions = torch.LongTensor(actions).unsqueeze(1).to(DEVICE)
+            rewards = torch.FloatTensor(rewards).unsqueeze(1).to(DEVICE)
+            next_states = torch.cat(next_states)
+            dones = torch.FloatTensor(dones).unsqueeze(1).to(DEVICE)
+            
+            current_q = policy_net(states).gather(1, actions)
+            next_q = target_net(next_states).max(1)[0].unsqueeze(1)
+            target_q = rewards + gamma * next_q * (1 - dones)
+            
+            loss = nn.MSELoss()(current_q, target_q)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
     
-    epsilon = max(epsilon_min, epsilon * epsilon_decay)
+    if episode in milestones:
+        milestone_paths[episode] = path.copy()
+    
+    if episode % target_update == 0:
+        target_net.load_state_dict(policy_net.state_dict())
+    
+    epsilon = max(epsilon_end, epsilon * epsilon_decay)
     
     rewards_per_episode.append(total_reward)
-    laps_per_episode.append(laps_completed)
+    checkpoints_per_episode.append(len(env.visited_checkpoints))
     epsilon_values.append(epsilon)
     
-    if (episode + 1) % 500 == 0:
-        elapsed = time.time() - start_time
-        avg_reward = np.mean(rewards_per_episode[-100:])
-        avg_laps = np.mean(laps_per_episode[-100:])
-        crashes = sum(1 for r in rewards_per_episode[-100:] if r <= -50)
-        
-        print(f"Ep {episode + 1}/{num_episodes} | "
-              f"Reward: {avg_reward:.1f} | "
-              f"Laps: {avg_laps:.2f} | "
-              f"Crashes: {crashes}/100 | "
+    elapsed = time.time() - start_time
+    avg_reward = np.mean(rewards_per_episode[-100:]) if len(rewards_per_episode) >= 100 else np.mean(rewards_per_episode)
+    avg_checkpoints = np.mean(checkpoints_per_episode[-100:]) if len(checkpoints_per_episode) >= 100 else np.mean(checkpoints_per_episode)
+    buffer_status = f"{len(replay_buffer)}/{replay_buffer.buffer.maxlen}"
+    
+    should_print = False
+    if episode < 100 and (episode + 1) % 10 == 0:
+        should_print = True
+    elif episode < 1000 and (episode + 1) % 50 == 0:
+        should_print = True
+    elif (episode + 1) % 200 == 0:
+        should_print = True
+    
+    if should_print:
+        learning_status = "WARMUP" if len(replay_buffer) < batch_size else "LEARNING"
+        print(f"Ep {episode+1:>5}/{num_episodes} [{learning_status}] | "
+              f"R: {avg_reward:>7.1f} | "
+              f"CP: {avg_checkpoints:>4.2f}/{len(checkpoint_regions)} | "
+              f"Steps: {steps:>4} | "
               f"ε: {epsilon:.3f} | "
               f"{elapsed:.0f}s")
 
 print(f"\nTraining complete: {(time.time()-start_time)/60:.1f} min")
 
 # ============================================================================
-# STEP 11: EVALUATION
+# VISUALIZATION
 # ============================================================================
 print("\n" + "=" * 70)
-print("EVALUATION")
+print("CREATING RESULTS")
 print("=" * 70)
 
-test_episodes = 100
-test_rewards = []
-test_laps = []
-test_crashes = 0
-
-for episode in range(test_episodes):
-    state = reset_environment()
-    done = False
-    total_reward = 0
-    laps_completed = 0
-    steps = 0
-    
-    while not done and steps < max_steps_per_episode:
-        action = np.argmax(q_table[state, :])
-        next_state, reward, done, laps_completed = step(state, action, laps_completed)
-        state = next_state
-        total_reward += reward
-        steps += 1
-    
-    test_rewards.append(total_reward)
-    test_laps.append(laps_completed)
-    if total_reward <= -50:
-        test_crashes += 1
-
-print(f"\nAverage reward: {np.mean(test_rewards):.1f}")
-print(f"Average laps: {np.mean(test_laps):.2f}")
-print(f"Max laps: {max(test_laps)}")
-print(f"Crashes: {test_crashes}/100")
-print(f"Success: {(100-test_crashes)/100*100:.1f}%")
-
-# ============================================================================
-# STEP 12: PLOTS
-# ============================================================================
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
 window = 100
-smoothed_rewards = np.convolve(rewards_per_episode, np.ones(window)/window, mode='valid')
-axes[0, 0].plot(smoothed_rewards, color='blue', linewidth=2)
-axes[0, 0].set_title('Training Rewards')
+if len(rewards_per_episode) > window:
+    smoothed_rewards = np.convolve(rewards_per_episode, np.ones(window)/window, mode='valid')
+    axes[0, 0].plot(smoothed_rewards, color='blue', linewidth=2)
+axes[0, 0].set_title('Training Rewards', fontsize=14, fontweight='bold')
+axes[0, 0].set_xlabel('Episode')
+axes[0, 0].set_ylabel('Reward')
 axes[0, 0].grid(True, alpha=0.3)
 
-smoothed_laps = np.convolve(laps_per_episode, np.ones(window)/window, mode='valid')
-axes[0, 1].plot(smoothed_laps, color='green', linewidth=2)
-axes[0, 1].set_title('Laps Completed')
+if len(checkpoints_per_episode) > window:
+    smoothed_checkpoints = np.convolve(checkpoints_per_episode, np.ones(window)/window, mode='valid')
+    axes[0, 1].plot(smoothed_checkpoints, color='green', linewidth=2)
+axes[0, 1].set_title('Checkpoints Collected', fontsize=14, fontweight='bold')
+axes[0, 1].set_xlabel('Episode')
+axes[0, 1].set_ylabel('Checkpoints')
 axes[0, 1].grid(True, alpha=0.3)
 
 axes[1, 0].plot(epsilon_values, color='orange', linewidth=2)
-axes[1, 0].set_title('Epsilon Decay')
+axes[1, 0].set_title('Epsilon Decay', fontsize=14, fontweight='bold')
+axes[1, 0].set_xlabel('Episode')
+axes[1, 0].set_ylabel('Epsilon')
 axes[1, 0].grid(True, alpha=0.3)
 
-axes[1, 1].imshow(img_array)
-axes[1, 1].plot([start_col], [start_row], 'go', markersize=10, label='Start')
-axes[1, 1].plot([finish_col], [finish_row], 'ro', markersize=10, label='Finish')
-axes[1, 1].set_title('Track Map')
-axes[1, 1].legend()
+axes[1, 1].imshow(map_colors, alpha=0.5)
+
+colors = plt.cm.viridis(np.linspace(0, 1, len(milestone_paths)))
+for idx, (ep, path) in enumerate(milestone_paths.items()):
+    if len(path) > 1:
+        rows = [p[0] for p in path]
+        cols = [p[1] for p in path]
+        axes[1, 1].plot(cols, rows, color=colors[idx], alpha=0.8, linewidth=2.5,
+                       label=f"Ep {ep}")
+
+axes[1, 1].set_title('Learning Progress: Milestone Paths', fontsize=14, fontweight='bold')
+axes[1, 1].legend(loc='upper right', fontsize=9)
 axes[1, 1].axis('off')
 
 plt.tight_layout()
-plt.savefig('laguna_seca_results.png', dpi=150)
-print("\nSaved: laguna_seca_results.png")
+plt.savefig('feedforward_dqn_results.png', dpi=150, bbox_inches='tight')
+print("Saved: feedforward_dqn_results.png")
 plt.show()
 
 print("\n" + "=" * 70)
