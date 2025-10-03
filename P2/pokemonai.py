@@ -508,7 +508,7 @@ if __name__ == "__main__":
     else:
         # Train the agent
         print("Starting training...")
-        stats = train_agent(rom_path, num_episodes=100, max_steps=1000)  # Short episodes for testing
+        stats = train_agent(rom_path, num_episodes=25, max_steps=100)  # Short episodes for testing
         
         # Create visualizations
         print("Creating visualizations...")
