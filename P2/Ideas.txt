@@ -1,0 +1,4 @@
+1. Grid of pixels for racetrack navigator - Forward pass DQN / PPO
+2. Gameboy Emulator ROM using Epilogue Operator - Qtable or DQN
+3. 
+
