@@ -11,31 +11,190 @@ from multiprocessing import Manager, Queue
 import signal
 from PIL import Image
 from datetime import datetime
+import psutil
+from torch.utils.tensorboard import SummaryWriter
+
+# ============================================================================
+# SYSTEM RESOURCE DETECTION AND OPTIMIZATION
+# ============================================================================
+
+def detect_optimal_device():
+    """Detect the best available device for training."""
+    print("🔍 Detecting available compute devices...")
+
+    # Check for CUDA (NVIDIA GPU)
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        device_name = torch.cuda.get_device_name(0)
+        print(f"✅ CUDA available: {device_count} GPU(s) - {device_name}")
+        return 'cuda'
+
+    # Check for MPS (Apple Silicon)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        print("✅ MPS available: Apple Silicon GPU")
+        return 'mps'
+
+    # Check for Intel NPU (if available)
+    try:
+        # This is a basic check - in practice, NPU detection might need platform-specific code
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            print("✅ XPU available: Intel GPU/NPU")
+            return 'xpu'
+    except:
+        pass
+
+    # Check for DirectML (Windows ML) as fallback for some GPUs
+    try:
+        import torch_directml
+        device = torch_directml.device()
+        print("✅ DirectML available: Windows ML acceleration")
+        return device
+    except ImportError:
+        pass
+
+    # Default to CPU
+    print("⚠️  No GPU acceleration available, using CPU")
+    return 'cpu'
+
+def detect_optimal_agent_count(device, visible_agents=1):
+    """Determine optimal number of agents based on system resources."""
+    print("🔍 Analyzing system resources for optimal agent count...")
+
+    # Get CPU information
+    cpu_count = mp.cpu_count()
+    print(f"   CPU cores: {cpu_count}")
+
+    # Get memory information
+    memory_gb = psutil.virtual_memory().total / (1024**3)
+    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    print(".1f")
+
+    # Base agent count on CPU cores, but adjust for memory and device
+    if device == 'cuda':
+        # GPU training - can handle more agents since GPU does the heavy lifting
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(".1f")
+
+        # Limit by GPU memory (each agent needs ~500MB GPU memory for PyBoy + model)
+        max_by_gpu_memory = int(gpu_memory_gb / 0.5)
+
+        # Also consider CPU cores for environment management
+        base_agents = min(cpu_count * 2, max_by_gpu_memory)
+
+    elif device == 'mps':
+        # Apple Silicon - similar to GPU but more conservative
+        base_agents = min(cpu_count * 1.5, int(memory_gb / 2))
+
+    elif device == 'xpu':
+        # Intel XPU - similar to CUDA
+        base_agents = min(cpu_count * 2, int(memory_gb / 1.5))
+
+    else:
+        # CPU-only training - more conservative
+        base_agents = min(cpu_count, int(memory_gb / 3))
+
+    # Ensure minimum of 1 agent, maximum reasonable limit
+    optimal_agents = max(1, min(base_agents, 5))  # Cap at 8 to prevent resource exhaustion
+
+    # Reserve some cores for system and visible agents
+    if visible_agents > 0:
+        optimal_agents = max(1, optimal_agents - 1)  # Reserve 1 core for visible agent management
+
+    print(f"   Optimal agent count: {optimal_agents} (device: {device})")
+    return optimal_agents
+
+def get_system_info():
+    """Get comprehensive system information for logging."""
+    info = {
+        'cpu_count': mp.cpu_count(),
+        'memory_total_gb': psutil.virtual_memory().total / (1024**3),
+        'memory_available_gb': psutil.virtual_memory().available / (1024**3),
+        'torch_version': torch.__version__,
+        'python_version': f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}"
+    }
+
+    if torch.cuda.is_available():
+        info['cuda_devices'] = torch.cuda.device_count()
+        info['cuda_device_names'] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+
+    return info
+
+# ============================================================================
+# AUTO-CONFIGURED HYPERPARAMETERS
+# ============================================================================
+
+# Detect optimal device and agent count
+DEVICE = detect_optimal_device() 
+NUM_AGENTS = 3 # detect_optimal_agent_count(DEVICE)
+NUM_VISIBLE_AGENTS = 1  # Keep one visible agent for monitoring
+
+# Adjust hyperparameters based on device
+if DEVICE == 'cuda':
+    # GPU-optimized settings
+    BATCH_SIZE = 1024  # Larger batch size for GPU
+    LEARNING_RATE = 0.1  # Slightly lower learning rate for stability
+    PPO_EPOCHS = 8  # More epochs for GPU training
+elif DEVICE in ['mps', 'xpu']:
+    # Accelerated device settings
+    BATCH_SIZE = 512
+    LEARNING_RATE = 0.1
+    PPO_EPOCHS = 5
+else:
+    # CPU-only settings (conservative)
+    BATCH_SIZE = 128  # Smaller batch for CPU memory
+    LEARNING_RATE = 0.1  # Lower learning rate for stability
+    PPO_EPOCHS = 3  # Fewer epochs to speed up training
 
 # ============================================================================
 # HYPERPARAMETERS - PPO STYLE
 # ============================================================================
 
-NUM_AGENTS = 5
-NUM_VISIBLE_AGENTS = 1  # Number of agents to show windows for
-EPISODES_PER_AGENT = 20
-MAX_STEPS_PER_EPISODE = 10000
+EPISODES_PER_AGENT = 5000
+MAX_STEPS_PER_EPISODE = 10000  # Increased from 10000 for better exploration
 
 # PPO hyperparameters
-LEARNING_RATE = 0.01
-DISCOUNT_FACTOR = 0.99
-GAE_LAMBDA = 0.95
-PPO_EPOCHS = 5
-PPO_CLIP = 0.2
-VALUE_COEF = 0.5
-ENTROPY_COEF = 0.01
-
-# Batch settings
-BATCH_SIZE = 512 # Reduced batch size for quicker updates
+DISCOUNT_FACTOR = 0.9 # lower discount for more immediate rewards
+GAE_LAMBDA = 0.995 # higher means longer-term advantage estimation
+PPO_CLIP = 0.5 # higher clip means more exploration
+VALUE_COEF = 0.5 # higher means more weight on value loss, which results in more stable training
+ENTROPY_COEF = 0.5 # Entropy bonus to encourage exploration, higher means more exploration
 
 # Knowledge pooling settings
 POOLING_FREQUENCY = 1  # Share knowledge every N episodes
-POOLING_ALPHA = 0.1    # Mixing coefficient for shared knowledge (0.1 = 10% shared, 90% individual)
+POOLING_ALPHA = 0.25    # Mixing coefficient for shared knowledge (0.25 = 25% shared, 75% individual)
+
+# ============================================================================
+# CONFIGURATION SUMMARY
+# ============================================================================
+
+def print_configuration_summary():
+    """Print a summary of the auto-detected configuration."""
+    system_info = get_system_info()
+
+    print("\n" + "="*80)
+    print("🤖 AUTO-CONFIGURATION SUMMARY")
+    print("="*80)
+    print(f"Device: {DEVICE}")
+    print(f"Agents: {NUM_AGENTS} total, {NUM_VISIBLE_AGENTS} visible")
+    print(f"Batch Size: {BATCH_SIZE}")
+    print(f"Learning Rate: {LEARNING_RATE}")
+    print(f"PPO Epochs: {PPO_EPOCHS}")
+    print()
+    print("System Resources:")
+    print(f"  CPU Cores: {system_info['cpu_count']}")
+    print(".1f")
+    print(f"  PyTorch: {system_info['torch_version']}")
+    print(f"  Python: {system_info['python_version']}")
+
+    if 'cuda_devices' in system_info:
+        print(f"  CUDA GPUs: {system_info['cuda_devices']}")
+        for i, name in enumerate(system_info['cuda_device_names']):
+            print(f"    GPU {i}: {name}")
+
+    print("="*80 + "\n")
+
+# Print configuration on import
+print_configuration_summary()
 
 # Pokemon Red memory addresses
 PLAYER_X_ADDRESS = 0xD362 
@@ -64,11 +223,18 @@ POKEDEX_OWNED_ADDRESS = 0xD2F7 # Start of pokedex "owned" data (19 bytes)
 POKEDEX_SEEN_ADDRESS = 0xD30A  # Start of pokedex "seen" data (19 bytes)
 WILD_BATTLE_FLAG_ADDRESS = 0xD12A # Flag indicating wild pokemon battle
 
+# NEW: Dialog and NPC interaction addresses
+TEXT_BOX_ACTIVE_ADDRESS = 0xC4CF       # 0 = no text, other = text showing
+JOYPAD_DISABLE_ADDRESS = 0xC2FA        # Player control disabled (dialog/cutscene)
+FACING_DIRECTION_ADDRESS = 0xC109       # 0=down, 4=up, 8=left, 12=right
+SPRITE_STATE_START_ADDRESS = 0xC100    # NPC/sprite data (check tiles in front)
+CURRENT_MAP_SCRIPT_ADDRESS = 0xCC4D    # Map script pointer (can detect events)
+
 # Window positions for visible agents
 WINDOW_POSITIONS = [
     (50, 50),
-    (400, 50),
-    (750, 50),
+    (50, 50),
+    (50, 50),
 ]
 
 # ============================================================================
@@ -167,11 +333,12 @@ def create_playable_save(rom_path, save_path='playable_state.state'):
 # ============================================================================
 
 class ActorCritic(nn.Module):
-    """PPO Actor-Critic network."""
-    def __init__(self, action_size=9, device='cpu'):
+    """PPO Actor-Critic network with enhanced state features."""
+    def __init__(self, action_size=7, device='cpu', feature_size=12):
         super(ActorCritic, self).__init__()
         
         self.device = device
+        self.feature_size = feature_size
         
         # Screen encoder
         self.conv = nn.Sequential(
@@ -183,29 +350,41 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
         
+        # Feature encoder for game state
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(feature_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU()
+        )
+        
         self.conv_out_size = None
         self.body = None
         self.actor = None
         self.critic = None
         self.action_size = action_size
     
-    def _get_conv_output(self, shape):
+    def _get_conv_output(self, shape, device):
         """Calculate conv output size."""
         with torch.no_grad():
-            dummy = torch.zeros(1, *shape)
+            dummy = torch.zeros(1, *shape, device=device)
             output = self.conv(dummy)
             return int(np.prod(output.size()))
     
-    def forward(self, screen):
-        # Ensure input is on the correct device
+    def forward(self, screen, features):
+        # Ensure inputs are on the correct device
         screen = screen.to(self.device)
+        features = features.to(self.device)
         
         # Initialize on first pass
         if self.conv_out_size is None:
-            self.conv_out_size = self._get_conv_output(screen.shape[1:])
+            self.conv_out_size = self._get_conv_output(screen.shape[1:], self.device)
+            
+            # Combine conv output + feature encoding
+            combined_size = self.conv_out_size + 128
             
             self.body = nn.Sequential(
-                nn.Linear(self.conv_out_size, 512),
+                nn.Linear(combined_size, 512),
                 nn.ReLU(),
                 nn.Dropout(0.1)
             ).to(self.device)
@@ -213,8 +392,15 @@ class ActorCritic(nn.Module):
             self.actor = nn.Linear(512, self.action_size).to(self.device)
             self.critic = nn.Linear(512, 1).to(self.device)
         
-        x = self.conv(screen)
-        x = x.view(x.size(0), -1)
+        # Process screen
+        conv_out = self.conv(screen)
+        conv_out = conv_out.view(conv_out.size(0), -1)
+        
+        # Process features
+        feature_out = self.feature_encoder(features)
+        
+        # Combine
+        x = torch.cat([conv_out, feature_out], dim=1)
         x = self.body(x)
         
         logits = self.actor(x)
@@ -237,9 +423,14 @@ class SharedModelManager:
         
     def save_agent_model(self, agent_id, model_state_dict, episode):
         """Save an agent's model for knowledge sharing."""
+        # Move all tensors to CPU before saving to ensure consistency
+        cpu_state_dict = {}
+        for key, tensor in model_state_dict.items():
+            cpu_state_dict[key] = tensor.cpu()
+        
         filename = f'agent_{agent_id}_ep_{episode}.pth'
         filepath = os.path.join(self.agent_models_dir, filename)
-        torch.save(model_state_dict, filepath)
+        torch.save(cpu_state_dict, filepath)
         print(f"📚 Agent {agent_id}: Saved model for knowledge pooling (Episode {episode})")
     
     def get_available_models(self, current_agent_id):
@@ -274,12 +465,15 @@ class SharedModelManager:
         valid_models = 0
         for model_path in available_models:
             try:
-                other_state = torch.load(model_path)
+                other_state = torch.load(model_path, map_location='cpu')  # Load to CPU first
                 valid_models += 1
                 
+                # Move all tensors to the same device as current model
                 for key in pooled_state.keys():
                     if key in other_state:
-                        pooled_state[key] += other_state[key]
+                        # Move to same device as pooled_state tensors
+                        other_tensor = other_state[key].to(pooled_state[key].device)
+                        pooled_state[key] += other_tensor
             except Exception as e:
                 print(f"⚠️  Failed to load {model_path}: {e}")
                 continue
@@ -315,6 +509,117 @@ class SharedModelManager:
                 os.remove(filepath)
             except:
                 pass
+
+# ============================================================================
+# TENSORBOARD LOGGING
+# ============================================================================
+
+class TensorBoardManager:
+    """Manages TensorBoard logging for training visualization."""
+    def __init__(self, log_dir='tensorboard_logs', run_name=None):
+        if run_name is None:
+            run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        self.log_dir = os.path.join(log_dir, run_name)
+        self.agent_writers = {}
+        self.global_writer = SummaryWriter(os.path.join(self.log_dir, 'global'))
+        
+        print(f"📊 TensorBoard logging initialized: {self.log_dir}")
+        print(f"   To view: tensorboard --logdir={log_dir}")
+    
+    def get_agent_writer(self, agent_id):
+        """Get or create writer for specific agent."""
+        if agent_id not in self.agent_writers:
+            agent_dir = os.path.join(self.log_dir, f'agent_{agent_id}')
+            self.agent_writers[agent_id] = SummaryWriter(agent_dir)
+        return self.agent_writers[agent_id]
+    
+    def log_episode(self, agent_id, episode, reward, steps, unique_positions, 
+                   policy_loss=None, value_loss=None, entropy=None):
+        """Log episode metrics for an agent."""
+        writer = self.get_agent_writer(agent_id)
+        
+        # Core metrics
+        writer.add_scalar('Episode/Reward', reward, episode)
+        writer.add_scalar('Episode/Steps', steps, episode)
+        writer.add_scalar('Episode/UniquePositions', unique_positions, episode)
+        writer.add_scalar('Episode/RewardPerStep', reward / max(steps, 1), episode)
+        
+        # Training metrics (if available)
+        if policy_loss is not None:
+            writer.add_scalar('Loss/Policy', policy_loss, episode)
+        if value_loss is not None:
+            writer.add_scalar('Loss/Value', value_loss, episode)
+        if entropy is not None:
+            writer.add_scalar('Loss/Entropy', entropy, episode)
+    
+    def log_global_metrics(self, episode, avg_reward, avg_steps, total_unique_positions,
+                          best_agent_id=None, best_reward=None):
+        """Log aggregate metrics across all agents."""
+        self.global_writer.add_scalar('Global/AverageReward', avg_reward, episode)
+        self.global_writer.add_scalar('Global/AverageSteps', avg_steps, episode)
+        self.global_writer.add_scalar('Global/TotalUniquePositions', total_unique_positions, episode)
+        
+        if best_agent_id is not None and best_reward is not None:
+            self.global_writer.add_scalar('Global/BestAgentReward', best_reward, episode)
+            self.global_writer.add_scalar('Global/BestAgentID', best_agent_id, episode)
+    
+    def log_game_state(self, agent_id, episode, money=0, badges=0, pokemon_count=0, 
+                      items=0, pokedex_owned=0, battles_won=0):
+        """Log Pokemon-specific game state metrics."""
+        writer = self.get_agent_writer(agent_id)
+        
+        writer.add_scalar('GameState/Money', money, episode)
+        writer.add_scalar('GameState/Badges', badges, episode)
+        writer.add_scalar('GameState/PokemonCount', pokemon_count, episode)
+        writer.add_scalar('GameState/Items', items, episode)
+        writer.add_scalar('GameState/PokedexOwned', pokedex_owned, episode)
+        writer.add_scalar('GameState/BattlesWon', battles_won, episode)
+    
+    def log_exploration(self, agent_id, episode, maps_visited=0, total_states_seen=0,
+                       screen_hash_unique=0):
+        """Log exploration metrics."""
+        writer = self.get_agent_writer(agent_id)
+        
+        writer.add_scalar('Exploration/MapsVisited', maps_visited, episode)
+        writer.add_scalar('Exploration/TotalStatesSeen', total_states_seen, episode)
+        writer.add_scalar('Exploration/ScreenHashUnique', screen_hash_unique, episode)
+    
+    def log_reward_breakdown(self, agent_id, episode, reward_components):
+        """Log detailed reward component breakdown."""
+        writer = self.get_agent_writer(agent_id)
+        
+        for component_name, value in reward_components.items():
+            writer.add_scalar(f'Rewards/{component_name}', value, episode)
+    
+    def log_system_metrics(self, episode, cpu_percent=0, memory_percent=0, gpu_memory_mb=0):
+        """Log system resource usage."""
+        self.global_writer.add_scalar('System/CPU_Percent', cpu_percent, episode)
+        self.global_writer.add_scalar('System/Memory_Percent', memory_percent, episode)
+        if gpu_memory_mb > 0:
+            self.global_writer.add_scalar('System/GPU_Memory_MB', gpu_memory_mb, episode)
+    
+    def log_knowledge_pooling(self, agent_id, episode, agents_pooled=0):
+        """Log knowledge pooling events."""
+        writer = self.get_agent_writer(agent_id)
+        writer.add_scalar('KnowledgePooling/AgentsPooled', agents_pooled, episode)
+    
+    def log_screen(self, agent_id, episode, screen_array, tag='Screen'):
+        """Log game screen visualization."""
+        writer = self.get_agent_writer(agent_id)
+        # Convert screen to CHW format (channel, height, width)
+        if len(screen_array.shape) == 2:  # Grayscale
+            screen_chw = screen_array[np.newaxis, :, :]
+        else:  # RGB
+            screen_chw = np.transpose(screen_array, (2, 0, 1))
+        writer.add_image(tag, screen_chw, episode, dataformats='CHW')
+    
+    def close_all(self):
+        """Close all TensorBoard writers."""
+        for writer in self.agent_writers.values():
+            writer.close()
+        self.global_writer.close()
+        print("📊 TensorBoard writers closed")
 
 # ============================================================================
 # SCREEN CAPTURE FOR VISUALIZATION
@@ -353,10 +658,22 @@ class PokemonEnv:
     """Pokemon Red environment with PPO interface."""
     
     def __init__(self, rom_path, agent_id, visible=False, window_pos=(0,0), 
-                 progress_queue=None, screen_capture_manager=None):
+                 progress_queue=None, screen_capture_manager=None, device='cpu', tensorboard_manager=None):
         self.agent_id = agent_id
         self.progress_queue = progress_queue
         self.screen_capture_manager = screen_capture_manager  # Re-enabled for milestones
+        self.device = device  # Store device for tensor operations
+        self.tensorboard_manager = tensorboard_manager  # TensorBoard logging
+        
+        # Reward tracking for detailed breakdown
+        self.reward_components = {
+            'exploration': 0,
+            'battle': 0,
+            'progression': 0,
+            'penalty': 0,
+            'movement': 0
+        }
+        self.battles_won = 0  # Track battle victories
         
         # Create PyBoy instance
         if visible:
@@ -378,11 +695,21 @@ class PokemonEnv:
         time.sleep(0.1)
         
         # Actions
-        self.actions = ['up', 'down', 'left', 'right', 'a', 'b', 'start', 'select', 'wait']
+        self.actions = ['up', 'down', 'left', 'right', 'a', 'b', 'wait']
         
         # Position tracking
         self.visited_positions = {}
         self.position_history = []
+        
+        # Direction consistency tracking (to reduce spinning)
+        self.last_direction = None
+        self.direction_consistency_count = 0
+        
+        # Memory system - track visited maps and state hashes
+        self.visited_maps = set()  # Track which maps we've been to
+        self.map_visit_times = {}  # Track when we last visited each map
+        self.state_memory = {}  # Map state hash -> (visit_count, last_visit_step)
+        self.screen_hash_history = []  # Recent screen hashes to detect loops
         
         # Game state tracking for rewards
         self.previous_money = 0
@@ -486,9 +813,23 @@ class PokemonEnv:
         """Get a hash representing the current game state for exploration tracking."""
         x, y, map_id = self._get_position()
         menu_open = self._is_menu_open()
+        in_battle = self._is_in_battle()
         # Create a simplified state representation
-        state = (x, y, map_id, menu_open)
+        state = (x, y, map_id, menu_open, in_battle)
         return hash(state)
+    
+    def _get_screen_hash(self):
+        """Get hash of the current screen for visual memory."""
+        screen = self.pyboy.screen.ndarray
+        # Downsample to 40x36 for efficiency (from 160x144)
+        small_screen = screen[::4, ::4, :]
+        return hash(small_screen.tobytes())
+    
+    def _is_in_recent_state(self, state_hash, lookback=20):
+        """Check if we've seen this state very recently (loop detection)."""
+        if len(self.screen_hash_history) < lookback:
+            return False
+        return state_hash in self.screen_hash_history[-lookback:]
     
     def _is_in_battle(self):
         """Check if currently in a battle."""
@@ -526,6 +867,39 @@ class PokemonEnv:
             # Count set bits in each byte
             count += bin(byte_val).count('1')
         return count
+    
+    def _is_in_dialog(self):
+        """Check if dialog/text box is active."""
+        text_active = self._read_memory(TEXT_BOX_ACTIVE_ADDRESS, 0) != 0
+        joypad_disabled = self._read_memory(JOYPAD_DISABLE_ADDRESS, 0) != 0
+        return text_active or joypad_disabled
+    
+    def _get_facing_direction(self):
+        """Get direction player is facing (0-3)."""
+        direction = self._read_memory(FACING_DIRECTION_ADDRESS, 0)
+        # Convert to 0-3: 0=down, 1=up, 2=left, 3=right
+        return min(direction // 4, 3)
+    
+    def _is_facing_npc(self):
+        """Check if an NPC/sprite is directly in front of the player."""
+        tile_front = self._read_memory(TILE_IN_FRONT_ADDRESS, 0)
+        # NPC tiles are typically in the range 0x01-0x0F (varies by map)
+        # This is a simplified check
+        return 0x01 <= tile_front <= 0x0F
+    
+    def _is_in_pokecenter(self):
+        """Check if inside a Pokemon Center."""
+        map_id = self._read_memory(MAP_ID_ADDRESS, 0)
+        # Pokemon Center map IDs in Pokemon Red (approximate)
+        pokecenter_maps = [0xC6, 0xC7, 0xC8, 0xC9, 0xCA]
+        return map_id in pokecenter_maps
+    
+    def _is_in_pokemart(self):
+        """Check if inside a Pokemart."""
+        map_id = self._read_memory(MAP_ID_ADDRESS, 0)
+        # Pokemart map IDs in Pokemon Red (approximate)
+        pokemart_maps = [0xCB, 0xCC, 0xCD, 0xCE, 0xCF]
+        return map_id in pokemart_maps
     
     def _detect_battle_victory(self):
         """Detect if a battle was just won."""
@@ -595,12 +969,36 @@ class PokemonEnv:
             return save_path
         return None
     
-    def get_screen_state(self):
+    def get_screen_state(self, device='cpu'):
         """Get screen as tensor."""
         screen = self.pyboy.screen.ndarray
         gray = np.dot(screen[...,:3], [0.299, 0.587, 0.114])
         gray = gray / 255.0
-        return torch.FloatTensor(gray).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        return torch.FloatTensor(gray).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, H, W]
+    
+    def get_enhanced_state(self, device='cpu'):
+        """Get enhanced state with game context features."""
+        # Original screen
+        screen = self.get_screen_state(device)
+        
+        # Additional state features (normalized to [0, 1])
+        x, y, map_id = self._get_position()
+        features = torch.FloatTensor([
+            x / 255.0,                                    # Player X (normalized)
+            y / 255.0,                                    # Player Y (normalized)
+            map_id / 255.0,                               # Map ID (normalized)
+            float(self._is_in_battle()),                  # Battle flag
+            float(self._is_menu_open()),                  # Menu flag
+            float(self._is_in_dialog()),                  # Dialog flag
+            self._get_pokemon_count() / 6.0,              # Pokemon count (0-6)
+            bin(self._get_badges()).count('1') / 8.0,     # Badge count (0-8)
+            self._get_facing_direction() / 3.0,           # Facing direction
+            float(self._is_facing_npc()),                 # Facing NPC
+            float(self._is_in_pokecenter()),              # In Pokecenter
+            float(self._is_in_pokemart()),                # In Pokemart
+        ]).unsqueeze(0).to(device)
+        
+        return screen, features
     
     def step(self, action_idx):
         """Execute action."""
@@ -647,7 +1045,7 @@ class PokemonEnv:
         # Check done
         done = self.steps >= MAX_STEPS_PER_EPISODE
         
-        next_state = self.get_screen_state()
+        next_state_screen, next_state_features = self.get_enhanced_state(self.device)
         
         info = {
             'position': new_pos_key,
@@ -655,11 +1053,59 @@ class PokemonEnv:
             'episode_reward': self.episode_reward
         }
         
-        return next_state, reward, done, info
+        return (next_state_screen, next_state_features), reward, done, info
     
     def _calculate_reward(self, prev_pos_key, new_pos_key):
-        """Calculate comprehensive reward based on game progression."""
+        """
+        Generalized reward function based on universal game principles.
+        Works for any Pokemon game or similar RPG, not hardcoded to specific maps.
+        """
         reward = 0
+        
+        # Reset reward component tracking
+        self.reward_components = {
+            'exploration': 0,
+            'battle': 0,
+            'progression': 0,
+            'penalty': 0,
+            'movement': 0
+        }
+        
+        # ===================================================================
+        # HYPERPARAMETERS - Adjust these to guide learning
+        # ===================================================================
+        LOOP_PENALTY = 0.002              # Penalty for repeating same screen
+        REVISIT_PENALTY_RATE = 0.002      # Penalty growth per revisit
+        MAX_REVISIT_PENALTY = 0.15       # Cap on revisit penalty
+        NEW_STATE_BONUS = 5.0           # Reward for discovering new screen
+        DIALOG_PENALTY = 0.001            # Penalty for being in dialog
+        MENU_PENALTY = 0.001              # Penalty for being in menu
+        STUCK_PENALTY = 0.25             # Penalty for not moving
+        DIRECTION_CONSISTENCY_BONUS = 0.001  # Reward for moving same direction
+        MAP_DISCOVERY_BONUS = 1.0      # Reward for discovering new area
+        MAP_REVISIT_QUICK_PENALTY = 0.003 # Penalty for returning to area too soon
+        MAP_REVISIT_LATE_BONUS = 0.001    # Bonus for legitimate return
+        MAP_REVISIT_THRESHOLD = 5000     # Steps before return is "legitimate"
+        BATTLE_REWARD = 10.0            # Being in battle is good
+        BATTLE_DAMAGE_MULTIPLIER = 1.0  # Reward per HP damage dealt
+        BATTLE_VICTORY_WILD = 150.0     # Winning wild battle
+        BATTLE_VICTORY_TRAINER = 250.0  # Winning trainer battle
+        POKEMON_CAPTURE_BASE = 300.0    # Base reward for catching Pokemon
+        POKEMON_CAPTURE_MULTIPLIER = 1.5  # Multiplier for new Pokedex entries
+        BADGE_REWARD = 100.0            # Earning a gym badge
+        ITEM_GAIN_REWARD = 5.0          # Getting new items
+        ITEM_USE_PENALTY = 0.005          # Small penalty for using items
+        MONEY_GAIN_MULTIPLIER = 0.1     # Reward per money unit gained
+        MONEY_SPEND_PENALTY = 0.001      # Small penalty for spending
+        HEALING_BASE_REWARD = 0.005       # Base reward for healing
+        HEALING_HP_MULTIPLIER = 0.01    # Reward per HP healed
+        TALL_GRASS_BONUS = 0.01         # Small bonus for being in wild areas
+        MOVEMENT_BONUS = 0.01            # Small reward for any movement
+        TIME_PENALTY = 0.01            # Penalty per step (encourages efficiency)
+        
+        # ===================================================================
+        # STATE TRACKING
+        # ===================================================================
         
         # Get current game state
         current_money = self._get_money()
@@ -668,114 +1114,240 @@ class PokemonEnv:
         current_pokemon_count = self._get_pokemon_count()
         current_elite_four_flags = self._get_elite_four_flags()
         current_pokemon_hp = self._get_pokemon_hp()
-        current_state_hash = self._get_game_state_hash()
+        screen_hash = self._get_screen_hash()
         menu_open = self._is_menu_open()
+        in_dialog = self._is_in_dialog()
         
-        # === EXPLORATION PENALTIES ===
-        # Penalty for visiting previously seen states (encourages exploration)
-        if current_state_hash in self.visited_states:
-            reward -= 0.01
+        # Update screen hash history (keep last 50 for loop detection)
+        self.screen_hash_history.append(screen_hash)
+        if len(self.screen_hash_history) > 50:
+            self.screen_hash_history.pop(0)
+        
+        # Update state memory
+        if screen_hash not in self.state_memory:
+            self.state_memory[screen_hash] = (0, self.steps)
+        visit_count, last_visit = self.state_memory[screen_hash]
+        self.state_memory[screen_hash] = (visit_count + 1, self.steps)
+        
+        # ===================================================================
+        # MEMORY-BASED REWARDS (Prevents exploits, encourages true exploration)
+        # ===================================================================
+        
+        # Penalty for revisiting same screen state too quickly (loop detection)
+        if self._is_in_recent_state(screen_hash, lookback=10):
+            penalty = LOOP_PENALTY
+            reward -= penalty
+            self.reward_components['penalty'] += penalty
+        
+        # Penalty for revisiting any state we've seen before
+        if visit_count > 0:
+            revisit_penalty = min(REVISIT_PENALTY_RATE * visit_count, MAX_REVISIT_PENALTY)
+            reward -= revisit_penalty
+            self.reward_components['penalty'] += revisit_penalty
         else:
-            self.visited_states.add(current_state_hash)
-            reward += 0.5  # Small bonus for new states
+            # Reward for truly new state (first time seeing this screen)
+            reward += NEW_STATE_BONUS
+            self.reward_components['exploration'] += NEW_STATE_BONUS
         
-        # Penalty for menu being open (encourages active gameplay)
+        # ===================================================================
+        # BEHAVIORAL PENALTIES (Discourage bad habits)
+        # ===================================================================
+        
+        # Penalty for dialog/NPC interaction spam
+        if in_dialog:
+            reward -= DIALOG_PENALTY
+            self.reward_components['penalty'] += DIALOG_PENALTY
+        
+        # Penalty for menu spam
         if menu_open:
-            reward -= 0.1
+            reward -= MENU_PENALTY
+            self.reward_components['penalty'] += MENU_PENALTY
         
-        # === BATTLE AND EXPLORATION REWARDS ===
-        # Battle state rewards
+        # Penalty for not moving (spinning/stuck)
+        if new_pos_key == prev_pos_key:
+            reward -= STUCK_PENALTY
+            self.reward_components['penalty'] += STUCK_PENALTY
+        
+        # ===================================================================
+        # MOVEMENT QUALITY (Encourage purposeful navigation)
+        # ===================================================================
+        
+        # Track movement direction for consistency
+        if new_pos_key != prev_pos_key:
+            dx = new_pos_key[0] - prev_pos_key[0]
+            dy = new_pos_key[1] - prev_pos_key[1]
+            current_direction = (dx, dy)
+            
+            if self.last_direction is not None and current_direction == self.last_direction:
+                self.direction_consistency_count += 1
+                reward += DIRECTION_CONSISTENCY_BONUS
+            else:
+                self.direction_consistency_count = 0
+            
+            self.last_direction = current_direction
+
+        # ===================================================================
+        # BATTLE SYSTEM (Universal combat rewards)
+        # ===================================================================
+        
         in_battle = self._is_in_battle()
         if in_battle:
-            reward += 0.01  # Reward for being in battle
+            battle_reward = BATTLE_REWARD
+            reward += battle_reward
+            self.reward_components['battle'] += battle_reward
             
-            # Damage dealing rewards
+            # Reward for dealing damage (skill demonstration)
             enemy_hp = self._get_enemy_hp()
             if self.previous_enemy_hp > 0 and enemy_hp < self.previous_enemy_hp:
                 damage_dealt = self.previous_enemy_hp - enemy_hp
-                reward += damage_dealt * 0.1  # Reward proportional to damage dealt
+                damage_reward = damage_dealt * BATTLE_DAMAGE_MULTIPLIER
+                reward += damage_reward
+                self.reward_components['battle'] += damage_reward
         
-        # Battle victory detection
+        # Battle victory detection (works for any game)
         if self._detect_battle_victory():
             if self._is_wild_battle():
-                reward += 15.0  # Reward for winning wild battles
-                self._capture_milestone("WILD_BATTLE_VICTORY")
+                victory_reward = BATTLE_VICTORY_WILD
+                reward += victory_reward
+                self.reward_components['battle'] += victory_reward
+                self._capture_milestone("BATTLE_WIN_WILD")
             else:
-                reward += 25.0  # Higher reward for winning trainer battles
-                self._capture_milestone("TRAINER_BATTLE_VICTORY")
+                victory_reward = BATTLE_VICTORY_TRAINER
+                reward += victory_reward
+                self.reward_components['battle'] += victory_reward
+                self._capture_milestone("BATTLE_WIN_TRAINER")
             self.battle_victory_detected = True
+            self.battles_won += 1
         
-        # Pokemon capture rewards (with multiplier for new pokedex entries)
+        # Pokemon capture (collecting is universal RPG mechanic)
         if self._detect_pokemon_capture():
             new_entries = self._get_pokedex_owned_count() - self.previous_pokedex_owned
-            reward += 30.0 * new_entries * 1.5  # Multiplied reward for new pokedex entries
+            capture_reward = POKEMON_CAPTURE_BASE * new_entries * POKEMON_CAPTURE_MULTIPLIER
+            reward += capture_reward
+            self.reward_components['progression'] += capture_reward
             self._capture_milestone("POKEMON_CAPTURE")
         
-        # Tall grass exploration bonus
+        # Wild area exploration (encourages finding encounters)
         if self._is_in_tall_grass():
-            reward += 0.001  # Small bonus for being in wild areas
+            grass_bonus = TALL_GRASS_BONUS
+            reward += grass_bonus
+            self.reward_components['exploration'] += grass_bonus
         
-        # Update battle tracking for next step
+        # Update battle tracking
         self.in_battle_last_step = in_battle
         self.previous_enemy_hp = self._get_enemy_hp()
         self.previous_current_pokemon_hp = self._get_current_pokemon_battle_hp()
         self.previous_pokedex_owned = self._get_pokedex_owned_count()
         
-        # === MAJOR PROGRESSION REWARDS ===
-        # Gym badges (major progression)
+        # ===================================================================
+        # PROGRESSION MILESTONES (Universal goal achievements)
+        # ===================================================================
+        
+        # Badge/achievement system (works for any game with achievements)
         badge_diff = bin(current_badges).count('1') - bin(self.previous_badges).count('1')
         if badge_diff > 0:
-            reward += 100.0 * badge_diff  # Big reward for gym victories
-            self._capture_milestone(f"GYM_BADGE_{bin(current_badges).count('1')}")
+            badge_reward = BADGE_REWARD * badge_diff
+            reward += badge_reward
+            self.reward_components['progression'] += badge_reward
+            self._capture_milestone(f"BADGE_{bin(current_badges).count('1')}")
         
-        # Elite Four progression (ultimate goal)
+        # End-game progression (elite four or equivalent)
         elite_four_diff = bin(current_elite_four_flags).count('1') - bin(self.previous_elite_four_flags).count('1')
         if elite_four_diff > 0:
-            reward += 500.0 * elite_four_diff  # Massive reward for elite four progress
-            self._capture_milestone(f"ELITE_FOUR_{bin(current_elite_four_flags).count('1')}")
+            endgame_reward = BADGE_REWARD * 5 * elite_four_diff
+            reward += endgame_reward
+            self.reward_components['progression'] += endgame_reward
+            self._capture_milestone(f"ENDGAME_{bin(current_elite_four_flags).count('1')}")
         
-        # === POKEMON AND ITEM MANAGEMENT ===
-        # Pokemon count changes (catching pokemon is good, losing some is slightly bad)
+        # ===================================================================
+        # RESOURCE MANAGEMENT (Universal RPG mechanics)
+        # ===================================================================
+        
+        # Party size changes (collecting team members)
         pokemon_diff = current_pokemon_count - self.previous_pokemon_count
         if pokemon_diff > 0:
-            reward += 20.0 * pokemon_diff  # Reward for catching pokemon
+            reward += POKEMON_CAPTURE_BASE / 15 * pokemon_diff  # Smaller reward than capture
         elif pokemon_diff < 0:
-            reward -= 2.0 * abs(pokemon_diff)  # Small penalty for losing pokemon (sometimes needed)
+            reward -= ITEM_GAIN_REWARD / 2 * abs(pokemon_diff)
         
-        # Item count changes (gaining items is good, losing some is slightly bad)
+        # Inventory changes (item collection)
         item_diff = current_item_count - self.previous_item_count
         if item_diff > 0:
-            reward += 5.0 * item_diff  # Reward for gaining items
+            reward += ITEM_GAIN_REWARD * item_diff
         elif item_diff < 0:
-            reward -= 0.5 * abs(item_diff)  # Very small penalty for using/losing items
+            reward -= ITEM_USE_PENALTY * abs(item_diff)
         
-        # === RESOURCE MANAGEMENT ===
-        # Money changes (gaining money is good)
+        # Currency changes (economic progress)
         money_diff = current_money - self.previous_money
         if money_diff > 0:
-            reward += 0.1 * money_diff  # Small reward proportional to money gained
+            reward += MONEY_GAIN_MULTIPLIER * money_diff
         elif money_diff < 0:
-            reward -= 0.01 * abs(money_diff)  # Very small penalty for spending money
+            reward -= MONEY_SPEND_PENALTY * abs(money_diff)
         
-        # Pokemon healing detection (reward for healing at pokecenters)
+        # Health management (healing is good strategy)
         for i in range(min(len(current_pokemon_hp), len(self.previous_pokemon_hp))):
             if current_pokemon_hp[i] > self.previous_pokemon_hp[i]:
-                # Pokemon was healed
                 heal_amount = current_pokemon_hp[i] - self.previous_pokemon_hp[i]
-                reward += 0.5 + (heal_amount * 0.01)  # Base healing reward + proportional bonus
+                reward += HEALING_BASE_REWARD + (heal_amount * HEALING_HP_MULTIPLIER)
         
-        # === MOVEMENT REWARDS (reduced from original) ===
-        # Small reward for moving to new positions
+        # ===================================================================
+        # BASIC MOVEMENT & TIME
+        # ===================================================================
+        
+        # Simple movement bonus (any position change is action)
         if new_pos_key != prev_pos_key:
-            if new_pos_key not in self.visited_positions:
-                reward += 1.0  # Reduced reward for new positions
+            reward += MOVEMENT_BONUS
+        
+        # Time penalty (encourages efficiency)
+        reward -= TIME_PENALTY
+        
+        # ===================================================================
+        # MAP EXPLORATION (General area discovery, not specific locations)
+        # ===================================================================
+        
+        current_map = new_pos_key[2]
+        prev_map = prev_pos_key[2]
+        
+        # Reward for discovering ANY new area (generalizes to any game)
+        if current_map != prev_map:
+            if current_map not in self.visited_maps:
+                # First time visiting this area - good exploration!
+                self.visited_maps.add(current_map)
+                map_reward = MAP_DISCOVERY_BONUS
+                reward += map_reward
+                self.reward_components['exploration'] += map_reward
+                print(f"  Agent {self.agent_id}: 🗺️  NEW AREA DISCOVERED! ID:{current_map}")
             else:
-                visit_count = self.visited_positions[new_pos_key]
-                if visit_count <= 3:
-                    reward += 0.2 / visit_count  # Much smaller revisit reward
+                # Revisiting a known area - check timing
+                steps_since_last = self.steps - self.map_visit_times.get(current_map, 0)
+                if steps_since_last > MAP_REVISIT_THRESHOLD:
+                    # Legitimate return after exploration
+                    revisit_bonus = MAP_REVISIT_LATE_BONUS
+                    reward += revisit_bonus
+                    self.reward_components['exploration'] += revisit_bonus
+                else:
+                    # Area flipping exploit - penalize
+                    flip_penalty = MAP_REVISIT_QUICK_PENALTY
+                    reward -= flip_penalty
+                    self.reward_components['penalty'] += flip_penalty
+            
+            # Update area visit time
+            self.map_visit_times[current_map] = self.steps
+        
+        # === MOVEMENT REWARDS (memory-based, not position-based) ===
+        # Movement is now rewarded through the screen hash memory system above
+        # This prevents gaming the system by moving between two spots repeatedly
+        
+        # Small bonus just for taking any movement action
+        if new_pos_key != prev_pos_key:
+            move_bonus = 0.1
+            reward += move_bonus
+            self.reward_components['movement'] += move_bonus
         
         # Base time penalty (encourages action)
-        reward -= 0.005
+        time_cost = 0.005
+        reward -= time_cost
+        self.reward_components['penalty'] += time_cost
         
         # Update previous state tracking
         self.previous_money = current_money
@@ -789,6 +1361,48 @@ class PokemonEnv:
     
     def reset(self):
         """Reset environment."""
+        # Log episode data to TensorBoard before resetting
+        if self.tensorboard_manager and self.total_episodes > 0:
+            self.tensorboard_manager.log_episode(
+                self.agent_id, self.total_episodes, 
+                self.episode_reward, self.steps, len(self.visited_positions)
+            )
+            
+            # Log game state
+            self.tensorboard_manager.log_game_state(
+                self.agent_id, self.total_episodes,
+                money=self._get_money(),
+                badges=bin(self._get_badges()).count('1'),
+                pokemon_count=self._get_pokemon_count(),
+                items=self._get_item_count(),
+                pokedex_owned=self._get_pokedex_owned_count(),
+                battles_won=self.battles_won
+            )
+            
+            # Log exploration metrics
+            self.tensorboard_manager.log_exploration(
+                self.agent_id, self.total_episodes,
+                maps_visited=len(self.visited_maps),
+                total_states_seen=len(self.state_memory),
+                screen_hash_unique=len(set(self.screen_hash_history))
+            )
+            
+            # Log reward breakdown
+            self.tensorboard_manager.log_reward_breakdown(
+                self.agent_id, self.total_episodes,
+                self.reward_components
+            )
+            
+            # Log screen occasionally (every 10 episodes)
+            if self.total_episodes % 10 == 0:
+                try:
+                    screen = self.pyboy.screen.ndarray.copy()
+                    self.tensorboard_manager.log_screen(
+                        self.agent_id, self.total_episodes, screen
+                    )
+                except:
+                    pass  # Skip if screen capture fails
+        
         with open('playable_state.state', 'rb') as f:
             self.pyboy.load_state(f)
         
@@ -797,6 +1411,16 @@ class PokemonEnv:
         self.steps = 0
         self.episode_reward = 0
         self.total_episodes += 1
+        
+        # Reset direction tracking
+        self.last_direction = None
+        self.direction_consistency_count = 0
+        
+        # Reset memory systems for new episode
+        self.visited_maps.clear()
+        self.map_visit_times.clear()
+        self.state_memory.clear()
+        self.screen_hash_history.clear()
         
         # Initialize previous state tracking
         self.previous_money = self._get_money()
@@ -816,7 +1440,7 @@ class PokemonEnv:
         
         self._update_position_tracking()
         
-        return self.get_screen_state()
+        return self.get_enhanced_state(self.device)
     
     def close(self):
         """Close environment."""
@@ -826,7 +1450,7 @@ class PokemonEnv:
 # PPO FUNCTIONS
 # ============================================================================
 
-def compute_gae(rewards, values, dones, gamma=DISCOUNT_FACTOR, lam=GAE_LAMBDA):
+def compute_gae(rewards, values, dones, gamma=DISCOUNT_FACTOR, lam=GAE_LAMBDA, device='cpu'):
     """Compute GAE."""
     advantages = []
     gae = 0
@@ -841,18 +1465,18 @@ def compute_gae(rewards, values, dones, gamma=DISCOUNT_FACTOR, lam=GAE_LAMBDA):
         gae = delta + gamma * lam * (1 - dones[i]) * gae
         advantages.insert(0, gae)
     
-    advantages = torch.FloatTensor(advantages)
-    returns = advantages + torch.FloatTensor(values)
+    advantages = torch.FloatTensor(advantages).to(device)
+    returns = advantages + torch.FloatTensor(values).to(device)
     
     return advantages, returns
 
-def ppo_update(policy, optimizer, states, actions, old_log_probs, advantages, returns, 
+def ppo_update(policy, optimizer, screens, features, actions, old_log_probs, advantages, returns, 
                epochs=PPO_EPOCHS, clip=PPO_CLIP):
-    """PPO update."""
+    """PPO update with enhanced state."""
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     
     for _ in range(epochs):
-        logits, values = policy(states)
+        logits, values = policy(screens, features)
         values = values.squeeze()
         
         probs = torch.softmax(logits, dim=-1)
@@ -890,11 +1514,17 @@ def signal_handler(sig, frame):
     training_interrupted = True
 
 def train_agent(agent_id, rom_path, num_episodes, visible, window_pos, 
-                progress_queue, screen_capture_manager, shared_models_dir=None):
+                progress_queue, screen_capture_manager, shared_models_dir=None, 
+                start_episode=0, tensorboard_log_dir=None):
     """Train single agent with PPO and knowledge pooling."""
     global training_interrupted
     
     print(f"\nAgent {agent_id}: Starting PPO training")
+    
+    # Create TensorBoard manager for this process
+    tensorboard_manager = None
+    if tensorboard_log_dir:
+        tensorboard_manager = TensorBoardManager(log_dir='tensorboard_logs', run_name=tensorboard_log_dir)
     
     # Create environment
     env = PokemonEnv(
@@ -902,39 +1532,57 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
         visible=visible, 
         window_pos=window_pos,
         progress_queue=progress_queue,
-        screen_capture_manager=screen_capture_manager if agent_id == 0 else None
+        screen_capture_manager=screen_capture_manager if agent_id == 0 else None,
+        device=DEVICE,
+        tensorboard_manager=tensorboard_manager
     )
     
     # Create policy
-    device = 'cpu'  # Use CPU for multiprocessing stability
-    policy = ActorCritic(action_size=9, device=device).to(device)
+    device = DEVICE  # Use detected optimal device
+    policy = ActorCritic(action_size=7, device=device).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=LEARNING_RATE)
     
-    # Initialize policy with dummy forward pass - with error handling
+    # Initialize policy with dummy forward pass FIRST (before loading)
     try:
-        dummy_state = env.reset()
+        # Create a dummy environment just for initialization
+        temp_env = PokemonEnv(rom_path, agent_id, visible=False, device=device)
+        dummy_state = temp_env.reset()
+        temp_env.close()
+        
         if dummy_state is None:
             raise ValueError("Environment reset returned None")
         
-        # dummy_state is already a tensor from get_screen_state()
-        if not isinstance(dummy_state, torch.Tensor):
-            raise ValueError(f"Expected tensor, got {type(dummy_state)}")
+        # dummy_state is now a tuple (screen, features)
+        if not isinstance(dummy_state, tuple) or len(dummy_state) != 2:
+            raise ValueError(f"Expected tuple of (screen, features), got {type(dummy_state)}")
         
-        # Validate tensor shape - should be [1, 1, height, width]
-        if len(dummy_state.shape) != 4:
-            raise ValueError(f"Invalid screen tensor shape: {dummy_state.shape}")
+        dummy_screen, dummy_features = dummy_state
+        
+        # Validate tensor shapes
+        if not isinstance(dummy_screen, torch.Tensor) or len(dummy_screen.shape) != 4:
+            raise ValueError(f"Invalid screen tensor shape: {dummy_screen.shape if isinstance(dummy_screen, torch.Tensor) else type(dummy_screen)}")
+        if not isinstance(dummy_features, torch.Tensor):
+            raise ValueError(f"Expected features tensor, got {type(dummy_features)}")
         
         with torch.no_grad():
-            _ = policy(dummy_state)  # Initialize model layers
+            _ = policy(dummy_screen, dummy_features)  # Initialize model layers
         
-        print(f"  Agent {agent_id}: Model initialized successfully")
+        print(f"  Agent {agent_id}: Model initialized successfully with enhanced state features")
         
     except Exception as e:
         print(f"  Agent {agent_id}: Model initialization failed: {e}")
-        print(f"  Agent {agent_id}: Dummy state type: {type(dummy_state)}")
-        print(f"  Agent {agent_id}: Dummy state shape: {dummy_state.shape if hasattr(dummy_state, 'shape') else 'No shape attr'}")
-        env.close()
         return
+    
+    # ALWAYS try to load existing model (resume by default)
+    model_path = f'agent_{agent_id}_ppo.pth'
+    if os.path.exists(model_path):
+        try:
+            policy.load_state_dict(torch.load(model_path, map_location=device))
+            print(f"  Agent {agent_id}: Loaded existing model from {model_path} (resuming training)")
+        except Exception as e:
+            print(f"  Agent {agent_id}: Could not load existing model: {e}, starting fresh")
+    else:
+        print(f"  Agent {agent_id}: No existing model found, starting fresh")
     
     # Create shared model manager if knowledge pooling is enabled
     shared_model_manager = None
@@ -942,7 +1590,7 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
         shared_model_manager = SharedModelManager(shared_models_dir)
     
     # Training loop
-    for episode in range(num_episodes):
+    for episode in range(start_episode, num_episodes):
         if training_interrupted:
             break
         
@@ -953,6 +1601,12 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
         values_batch = []
         log_probs_batch = []
         dones_batch = []
+        
+        # Track losses for this episode
+        episode_policy_loss = 0
+        episode_value_loss = 0
+        episode_entropy = 0
+        update_count = 0
         
         # Reset
         state = env.reset()
@@ -965,9 +1619,12 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
                 break
             
             try:
+                # Unpack state (screen, features)
+                state_screen, state_features = state
+                
                 # Get action
                 with torch.no_grad():
-                    logits, value = policy(state)
+                    logits, value = policy(state_screen, state_features)
                     probs = torch.softmax(logits, dim=-1)
                     dist = torch.distributions.Categorical(probs)
                     action = dist.sample()
@@ -977,7 +1634,7 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
                 next_state, reward, done, info = env.step(action.item())
                 
                 # Validate next_state
-                if next_state is None or not isinstance(next_state, torch.Tensor):
+                if next_state is None or not isinstance(next_state, tuple):
                     print(f"  Agent {agent_id}: Invalid next_state: {type(next_state)}")
                     break
                 
@@ -985,8 +1642,8 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
                 print(f"  Agent {agent_id}: Error during step {steps}: {e}")
                 break
             
-            # Store
-            states_batch.append(state)
+            # Store (store screen and features separately)
+            states_batch.append((state_screen, state_features))
             actions_batch.append(action)
             rewards_batch.append(reward)
             values_batch.append(value.item())
@@ -1000,17 +1657,28 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
             if len(states_batch) >= BATCH_SIZE or done:
                 try:
                     advantages, returns = compute_gae(
-                        rewards_batch, values_batch, dones_batch
+                        rewards_batch, values_batch, dones_batch, device=device
                     )
                     
-                    states_tensor = torch.cat(states_batch, dim=0)
-                    actions_tensor = torch.LongTensor([a.item() for a in actions_batch])
-                    old_log_probs_tensor = torch.stack(log_probs_batch)
+                    # Separate screens and features
+                    screens_list = [s[0] for s in states_batch]
+                    features_list = [s[1] for s in states_batch]
                     
-                    ppo_update(
-                        policy, optimizer, states_tensor, actions_tensor,
+                    screens_tensor = torch.cat(screens_list, dim=0).to(device)
+                    features_tensor = torch.cat(features_list, dim=0).to(device)
+                    actions_tensor = torch.LongTensor([a.item() for a in actions_batch]).to(device)
+                    old_log_probs_tensor = torch.stack(log_probs_batch).to(device)
+                    
+                    policy_loss, value_loss, entropy = ppo_update(
+                        policy, optimizer, screens_tensor, features_tensor, actions_tensor,
                         old_log_probs_tensor, advantages, returns
                     )
+                    
+                    # Accumulate losses
+                    episode_policy_loss += policy_loss
+                    episode_value_loss += value_loss
+                    episode_entropy += entropy
+                    update_count += 1
                     
                 except Exception as e:
                     print(f"  Agent {agent_id}: PPO update error: {e}")
@@ -1030,6 +1698,27 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
                   f"R={env.episode_reward:.1f}, "
                   f"UniquePos={len(env.visited_positions)}, "
                   f"Steps={steps}")
+            
+            # Log losses to TensorBoard
+            if tensorboard_manager and update_count > 0:
+                avg_policy_loss = episode_policy_loss / update_count
+                avg_value_loss = episode_value_loss / update_count
+                avg_entropy = episode_entropy / update_count
+                
+                tensorboard_manager.log_episode(
+                    agent_id, episode, env.episode_reward, steps, len(env.visited_positions),
+                    policy_loss=avg_policy_loss, value_loss=avg_value_loss, entropy=avg_entropy
+                )
+        
+        # Save training progress
+        if not training_interrupted:
+            # Save model after each episode for resume capability
+            cpu_state_dict = {}
+            for key, tensor in policy.state_dict().items():
+                cpu_state_dict[key] = tensor.cpu()
+            torch.save(cpu_state_dict, f'agent_{agent_id}_ppo.pth')
+            
+            # Save training state (this will be called from main process, but we save model here)
         
         # Knowledge pooling at checkpoints
         if shared_model_manager and (episode + 1) % POOLING_FREQUENCY == 0:
@@ -1040,14 +1729,26 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
             mixed_state = shared_model_manager.pool_knowledge(agent_id, policy.state_dict())
             policy.load_state_dict(mixed_state)
             
+            # Log knowledge pooling event
+            if tensorboard_manager:
+                agents_pooled = len(shared_model_manager.get_available_models(agent_id))
+                tensorboard_manager.log_knowledge_pooling(agent_id, episode, agents_pooled)
+            
             # Cleanup old models periodically
             if episode > 10:
                 shared_model_manager.cleanup_old_models()
     
     # Save final model
-    torch.save(policy.state_dict(), f'agent_{agent_id}_ppo.pth')
+    cpu_state_dict = {}
+    for key, tensor in policy.state_dict().items():
+        cpu_state_dict[key] = tensor.cpu()
+    torch.save(cpu_state_dict, f'agent_{agent_id}_ppo.pth')
     
     print(f"\n✓ Agent {agent_id} complete! Unique positions: {len(env.visited_positions)}")
+    
+    # Close TensorBoard writer
+    if tensorboard_manager:
+        tensorboard_manager.close_all()
     
     env.close()
 
@@ -1055,9 +1756,15 @@ def train_agent(agent_id, rom_path, num_episodes, visible, window_pos,
 # PROGRESS MONITOR
 # ============================================================================
 
-def monitor_progress(progress_queue, num_agents):
+def monitor_progress(progress_queue, num_agents, tensorboard_log_dir=None):
     """Monitor and display training progress."""
     agent_stats = {i: {} for i in range(num_agents)}
+    agent_episodes = {i: 0 for i in range(num_agents)}  # Track completed episodes
+    
+    # Create TensorBoard manager for this process
+    tensorboard_manager = None
+    if tensorboard_log_dir:
+        tensorboard_manager = TensorBoardManager(log_dir='tensorboard_logs', run_name=tensorboard_log_dir)
     
     print("\n" + "="*80)
     print("TRAINING PROGRESS MONITOR")
@@ -1065,6 +1772,8 @@ def monitor_progress(progress_queue, num_agents):
     print("Receiving updates from agents...\n")
     
     last_print = time.time()
+    last_save = time.time()
+    last_global_log = time.time()
     
     while True:
         try:
@@ -1075,8 +1784,54 @@ def monitor_progress(progress_queue, num_agents):
             agent_id = update['agent_id']
             agent_stats[agent_id] = update
             
+            # Update episode count if this is a new episode completion
+            current_episode = update.get('episode', 0)
+            if current_episode > agent_episodes[agent_id]:
+                agent_episodes[agent_id] = current_episode
+            
+            # Save training state every 30 seconds
+            if time.time() - last_save > 30:
+                save_training_state(agent_episodes)
+                last_save = time.time()
+            
+            # Log global metrics every 60 seconds
+            if tensorboard_manager and time.time() - last_global_log > 60:
+                if len(agent_stats) > 0:
+                    rewards = [s.get('reward', 0) for s in agent_stats.values() if s]
+                    steps = [s.get('steps', 0) for s in agent_stats.values() if s]
+                    unique_positions = [s.get('unique_positions', 0) for s in agent_stats.values() if s]
+                    
+                    if rewards:
+                        avg_reward = sum(rewards) / len(rewards)
+                        avg_steps = sum(steps) / len(steps)
+                        total_unique = sum(unique_positions)
+                        
+                        best_agent_id = max(agent_stats.keys(), key=lambda x: agent_stats[x].get('reward', 0) if agent_stats[x] else 0)
+                        best_reward = agent_stats[best_agent_id].get('reward', 0) if agent_stats[best_agent_id] else 0
+                        
+                        # Use max episode as the global episode counter
+                        global_episode = max(agent_episodes.values())
+                        
+                        tensorboard_manager.log_global_metrics(
+                            global_episode, avg_reward, avg_steps, total_unique,
+                            best_agent_id, best_reward
+                        )
+                        
+                        # Log system metrics
+                        cpu_percent = psutil.cpu_percent()
+                        memory_percent = psutil.virtual_memory().percent
+                        gpu_memory_mb = 0
+                        if torch.cuda.is_available():
+                            gpu_memory_mb = torch.cuda.memory_allocated(0) / (1024 * 1024)
+                        
+                        tensorboard_manager.log_system_metrics(
+                            global_episode, cpu_percent, memory_percent, gpu_memory_mb
+                        )
+                
+                last_global_log = time.time()
+            
             # Print every 10 seconds
-            if time.time() - last_print > 10:
+            if time.time() - last_print > 5:
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Current Status:")
                 print("-" * 80)
                 for aid in sorted(agent_stats.keys()):
@@ -1097,6 +1852,77 @@ def monitor_progress(progress_queue, num_agents):
             continue
 
 # ============================================================================
+# TRAINING STATE MANAGEMENT
+# ============================================================================
+
+def save_training_state(agent_episodes_completed, training_stats_file='training_state.pkl'):
+    """Save the current training state for resume capability."""
+    state = {
+        'agent_episodes_completed': agent_episodes_completed,
+        'timestamp': datetime.now().isoformat(),
+        'config': {
+            'num_agents': NUM_AGENTS,
+            'episodes_per_agent': EPISODES_PER_AGENT,
+            'device': DEVICE
+        }
+    }
+    with open(training_stats_file, 'wb') as f:
+        pickle.dump(state, f)
+
+def load_training_state(training_stats_file='training_state.pkl'):
+    """Load training state if it exists and is valid."""
+    if not os.path.exists(training_stats_file):
+        return None
+    
+    try:
+        with open(training_stats_file, 'rb') as f:
+            state = pickle.load(f)
+        
+        # Validate the state matches current configuration
+        config = state.get('config', {})
+        if (config.get('num_agents') == NUM_AGENTS and 
+            config.get('episodes_per_agent') == EPISODES_PER_AGENT and
+            config.get('device') == DEVICE):
+            return state
+        else:
+            print("⚠️  Training configuration changed, starting fresh training")
+            return None
+    except Exception as e:
+        print(f"⚠️  Could not load training state: {e}")
+        return None
+
+def check_resume_training():
+    """Check if we can resume previous training."""
+    # Check for training state file
+    state = load_training_state()
+    if state is None:
+        return None, None
+    
+    agent_episodes_completed = state['agent_episodes_completed']
+    
+    # Check if all agents have model files
+    missing_models = []
+    for agent_id in range(NUM_AGENTS):
+        model_path = f'agent_{agent_id}_ppo.pth'
+        if not os.path.exists(model_path):
+            missing_models.append(agent_id)
+    
+    if missing_models:
+        print(f"⚠️  Missing model files for agents: {missing_models}, starting fresh training")
+        return None, None
+    
+    # Check if training was completed
+    total_completed = sum(agent_episodes_completed.values())
+    total_expected = NUM_AGENTS * EPISODES_PER_AGENT
+    
+    if total_completed >= total_expected:
+        print("✅ Previous training appears complete")
+        return None, None
+    
+    print(f"📋 Found resumable training: {total_completed}/{total_expected} episodes completed")
+    return agent_episodes_completed, state['timestamp']
+
+# ============================================================================
 # PARALLEL TRAINING
 # ============================================================================
 
@@ -1114,17 +1940,64 @@ def train_swarm_with_monitoring(rom_path, num_agents=NUM_AGENTS,
     print("\nPress Ctrl+C to stop and save")
     print()
     
+    # Check for resumable training
+    agent_episodes_completed, resume_timestamp = check_resume_training()
+    start_episodes = {}
+    
+    if agent_episodes_completed:
+        print(f"🔄 Resuming training from {resume_timestamp}")
+        for agent_id in range(num_agents):
+            start_episodes[agent_id] = agent_episodes_completed.get(agent_id, 0)
+        print(f"   Agent start episodes: {start_episodes}")
+    else:
+        print("🆕 Starting fresh training")
+        for agent_id in range(num_agents):
+            start_episodes[agent_id] = 0
+    
     # Create shared resources
     manager = Manager()
     progress_queue = manager.Queue()
     screen_capture_manager = ScreenCaptureManager()
     
+    # Create TensorBoard run name (to be used by each process independently)
+    run_name = f"pokemon_ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    print(f"📊 TensorBoard logging: tensorboard_logs/{run_name}")
+    print(f"   To view: tensorboard --logdir=tensorboard_logs")
+    
+    # Try to auto-launch TensorBoard
+    tensorboard_process = None
+    try:
+        import subprocess
+        import webbrowser
+        print("\n🚀 Attempting to auto-launch TensorBoard...")
+        tensorboard_process = subprocess.Popen(
+            [os.sys.executable, '-m', 'tensorboard.main', '--logdir', 'tensorboard_logs', '--port', '6006'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(2)  # Give it time to start
+        if tensorboard_process.poll() is None:
+            print("✅ TensorBoard launched successfully!")
+            print("   Opening browser to http://localhost:6006...")
+            try:
+                webbrowser.open('http://localhost:6006')
+                print("✅ Browser opened!")
+            except:
+                print("⚠️  Could not auto-open browser. Visit: http://localhost:6006")
+        else:
+            print("⚠️  TensorBoard failed to start (may already be running)")
+            tensorboard_process = None
+    except Exception as e:
+        print(f"⚠️  Could not auto-launch TensorBoard: {e}")
+        print("   You can manually launch: tensorboard --logdir=tensorboard_logs")
+        tensorboard_process = None
+    
     # Create shared model manager for knowledge pooling
     shared_models_dir = 'shared_models'
     print(f"🧠 Knowledge pooling enabled: Every {POOLING_FREQUENCY} episodes, α={POOLING_ALPHA}")
     
-    # Start progress monitor
-    monitor_proc = mp.Process(target=monitor_progress, args=(progress_queue, num_agents))
+    # Start progress monitor (pass run_name, not the manager object)
+    monitor_proc = mp.Process(target=monitor_progress, args=(progress_queue, num_agents, run_name))
     monitor_proc.start()
     
     # Start training processes
@@ -1137,11 +2010,15 @@ def train_swarm_with_monitoring(rom_path, num_agents=NUM_AGENTS,
         p = mp.Process(
             target=train_agent,
             args=(agent_id, rom_path, num_episodes, visible, window_pos, 
-                  progress_queue, screen_capture_manager, shared_models_dir)
+                  progress_queue, screen_capture_manager, shared_models_dir, 
+                  start_episodes[agent_id], run_name)
         )
         p.start()
         processes.append(p)
         time.sleep(0.5)
+    
+    # Track progress for saving state
+    agent_progress = {i: start_episodes[i] for i in range(num_agents)}
     
     # Wait for training
     try:
@@ -1152,13 +2029,32 @@ def train_swarm_with_monitoring(rom_path, num_agents=NUM_AGENTS,
         for p in processes:
             p.join(timeout=10)
     
+    # Save final training state
+    if not training_interrupted:
+        # Mark all as completed
+        final_episodes = {i: num_episodes for i in range(num_agents)}
+        save_training_state(final_episodes)
+    
     # Stop monitor
     monitor_proc.terminate()
     monitor_proc.join(timeout=5)
     
+    # Stop TensorBoard if we started it
+    if tensorboard_process and tensorboard_process.poll() is None:
+        print("\n🛑 Stopping TensorBoard...")
+        tensorboard_process.terminate()
+        try:
+            tensorboard_process.wait(timeout=5)
+        except:
+            tensorboard_process.kill()
+    
+    # Note: TensorBoard writers are closed automatically in each process
+    
     print(f"\n{'='*80}")
     print("TRAINING COMPLETE")
     print(f"{'='*80}")
+    print(f"\n📊 TensorBoard logs saved to: tensorboard_logs/{run_name}")
+    print(f"   View with: tensorboard --logdir=tensorboard_logs")
     
     # Create best agent model from knowledge pooling
     if os.path.exists(shared_models_dir):
@@ -1186,7 +2082,7 @@ def create_best_agent_model(shared_models_dir):
     
     for model_path in final_models:
         try:
-            agent_state = torch.load(model_path)
+            agent_state = torch.load(model_path, map_location='cpu')  # Load to CPU first
             valid_models += 1
             
             if pooled_state is None:
@@ -1196,7 +2092,9 @@ def create_best_agent_model(shared_models_dir):
             else:
                 for key in pooled_state.keys():
                     if key in agent_state:
-                        pooled_state[key] += agent_state[key]
+                        # Move to same device as pooled_state tensors
+                        agent_tensor = agent_state[key].to(pooled_state[key].device)
+                        pooled_state[key] += agent_tensor
         except Exception as e:
             print(f"⚠️  Failed to load {model_path}: {e}")
             continue
@@ -1219,90 +2117,7 @@ def create_best_agent_model(shared_models_dir):
 # DEMO MODE
 # ============================================================================
 
-def demo_agent(agent_id, rom_path, max_steps=5000):
-    """Watch trained agent."""
-    print(f"\n{'='*80}")
-    print(f"DEMO MODE - Agent {agent_id}")
-    print(f"{'='*80}\n")
 
-    # Check for best agent model first
-    if agent_id == 'best' or agent_id == -1:
-        model_path = 'best_agent_ppo.pth'
-        if os.path.exists(model_path):
-            display_name = "Best Agent (Pooled Knowledge)"
-        else:
-            print("❌ Best agent model not found! Using Agent 0 instead.")
-            model_path = 'agent_0_ppo.pth'
-            display_name = "Agent 0"
-    else:
-        model_path = f'agent_{agent_id}_ppo.pth'
-        display_name = f"Agent {agent_id}"
-    
-    if not os.path.exists(model_path):
-        print(f"ERROR: {model_path} not found!")
-        return
-
-    print(f"Loading model: {display_name}")
-
-    # Create environment first to get proper screen dimensions
-    env = PokemonEnv(rom_path, 0, visible=True, window_pos=(100, 100))
-    
-    # Initialize policy with proper dimensions
-    device = 'cpu'
-    policy = ActorCritic(action_size=9, device=device).to(device)
-    
-    # Initialize the model with a dummy forward pass
-    dummy_state = env.reset()
-    with torch.no_grad():
-        _ = policy(dummy_state)  # This initializes the model layers
-    
-    # Now load the saved state dict
-    policy.load_state_dict(torch.load(model_path, map_location=device))
-    policy.eval()
-    
-    print(f"Loaded PPO policy from {model_path}")
-    
-    env.pyboy.set_emulation_speed(1)
-    state = env.reset()
-    total_reward = 0
-    steps = 0
-    
-    print("\nWatching agent...")
-    print("Press Ctrl+C to stop\n")
-    
-    try:
-        while steps < max_steps:
-            with torch.no_grad():
-                logits, _ = policy(state)
-                probs = torch.softmax(logits, dim=-1)
-                action = probs.argmax()
-            
-            next_state, reward, done, info = env.step(action.item())
-            
-            state = next_state
-            total_reward += reward
-            steps += 1
-            
-            if steps % 100 == 0:
-                pos = info['position']
-                print(f"Steps: {steps}, "
-                      f"UniquePos: {info['unique_positions']}, "
-                      f"R: {total_reward:.1f}, "
-                      f"Map: {pos[2]} ({pos[0]},{pos[1]})")
-            
-            if done:
-                print(f"\nEpisode ended at {steps}")
-                state = env.reset()
-                total_reward = 0
-            
-            time.sleep(0.02)
-    
-    except KeyboardInterrupt:
-        print("\n\nDemo stopped")
-    
-    print(f"\nFinal: {steps} steps, {len(env.visited_positions)} unique positions")
-    
-    env.close()
 
 # ============================================================================
 # MAIN
@@ -1318,7 +2133,7 @@ if __name__ == "__main__":
         exit(1)
     
     print("="*80)
-    print("POKEMON PPO TRAINER")
+    print("POKEMON PPO TRAINER - AUTO START")
     print("="*80)
     
     if not os.path.exists('playable_state.state'):
@@ -1326,62 +2141,32 @@ if __name__ == "__main__":
         screen_worked = create_playable_save(ROM_PATH)
         if not screen_worked:
             print("\n⚠ WARNING: Screen didn't change!")
-            response = input("Continue? (y/n): ")
-            if response.lower() != 'y':
-                exit(1)
+            print("Continuing anyway...")
     
-    while True:
-        print("\n" + "="*80)
-        print("MAIN MENU")
-        print("="*80)
-        print("\n1. Train with live monitoring (PPO)")
-        print("2. Demo trained agent")
-        print("3. Exit")
-        
-        choice = input("\nChoice (1-3): ").strip()
-        
-        if choice == '1':
-            print(f"\nConfiguration:")
-            print(f"  Algorithm: PPO")
-            print(f"  Agents: {NUM_AGENTS} ({NUM_VISIBLE_AGENTS} visible)")
-            print(f"  Episodes: {EPISODES_PER_AGENT}")
-            print(f"  Max steps: {MAX_STEPS_PER_EPISODE}")
-            print(f"\nLive console updates every 10 seconds")
-            print(f"Screen captures saved to: screen_captures/")
-            
-            confirm = input("\nStart? (y/n): ").strip().lower()
-            if confirm == 'y':
-                train_swarm_with_monitoring(ROM_PATH)
-        
-        elif choice == '2':
-            available = [i for i in range(NUM_AGENTS) 
-                        if os.path.exists(f'agent_{i}_ppo.pth')]
-            
-            if not available and not os.path.exists('best_agent_ppo.pth'):
-                print("\nNo trained agents!")
-                continue
-            
-            options = []
-            if available:
-                options.extend(available)
-            if os.path.exists('best_agent_ppo.pth'):
-                options.append('best')
-            
-            print(f"\nAvailable: {available}")
-            if os.path.exists('best_agent_ppo.pth'):
-                print("Special: 'best' (pooled knowledge from all agents)")
-            
-            agent_input = input("Agent ID (0 or 'best'): ").strip().lower()
-            
-            if agent_input == 'best' or agent_input == 'b':
-                demo_agent('best', ROM_PATH)
-            else:
-                agent_id = int(agent_input) if agent_input.isdigit() else 0
-                if agent_id not in available:
-                    print(f"Agent {agent_id} not found!")
-                    continue
-                demo_agent(agent_id, ROM_PATH)
-        
-        elif choice == '3':
-            print("\nGoodbye!")
-            break
+    print(f"\nConfiguration:")
+    print(f"  Algorithm: PPO with Enhanced State Space")
+    print(f"  Agents: {NUM_AGENTS} ({NUM_VISIBLE_AGENTS} visible)")
+    print(f"  Episodes: {EPISODES_PER_AGENT}")
+    print(f"  Max steps: {MAX_STEPS_PER_EPISODE}")
+    print(f"  Auto-resume: Enabled (will load existing models)")
+    print(f"\nFeatures:")
+    print(f"  - Live visualization of training progress")
+    print(f"  - Console updates every 10 seconds")
+    print(f"  - Automatic model saving and resuming")
+    print(f"  - Knowledge pooling between agents")
+    print(f"  - TensorBoard logging enabled")
+    print(f"\n📊 TensorBoard:")
+    print(f"  Launch: tensorboard --logdir=tensorboard_logs")
+    print(f"  Then open: http://localhost:6006")
+    print(f"\nPress Ctrl+C to stop training and save progress")
+    
+    input("\nPress Enter to start training...")
+    
+    train_swarm_with_monitoring(ROM_PATH)
+    
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE!")
+    print("="*80)
+    print("\n📊 To view a trained agent, run: python evaluate_model.py")
+    print("   (This file should be in your directory for demo mode)")
+    print("\nGoodbye!")
