@@ -130,38 +130,38 @@ NUM_VISIBLE_AGENTS = 1  # Keep one visible agent for monitoring
 
 # Adjust hyperparameters based on device
 if DEVICE == 'cuda':
-    # GPU-optimized settings
-    BATCH_SIZE = 1024  # Larger batch size for GPU
-    LEARNING_RATE = 0.1  # Slightly lower learning rate for stability
-    PPO_EPOCHS = 8  # More epochs for GPU training
+    # GPU-optimized settings with STRONG exploration bias
+    BATCH_SIZE = 512  # Smaller batch = more updates = more exploration variety
+    LEARNING_RATE = 0.0003  # Lower LR = slower convergence = longer exploration phase
+    PPO_EPOCHS = 4  # Fewer epochs = less overfitting to current policy
 elif DEVICE in ['mps', 'xpu']:
     # Accelerated device settings
-    BATCH_SIZE = 512
-    LEARNING_RATE = 0.1
-    PPO_EPOCHS = 5
+    BATCH_SIZE = 256
+    LEARNING_RATE = 0.0005
+    PPO_EPOCHS = 3
 else:
     # CPU-only settings (conservative)
     BATCH_SIZE = 128  # Smaller batch for CPU memory
-    LEARNING_RATE = 0.1  # Lower learning rate for stability
+    LEARNING_RATE = 0.0005  # Lower learning rate for stability
     PPO_EPOCHS = 3  # Fewer epochs to speed up training
 
 # ============================================================================
-# HYPERPARAMETERS - PPO STYLE
+# HYPERPARAMETERS - PPO STYLE (EXPLORATION FOCUSED)
 # ============================================================================
 
 EPISODES_PER_AGENT = 5000
-MAX_STEPS_PER_EPISODE = 10000  # Increased from 10000 for better exploration
+MAX_STEPS_PER_EPISODE = 15000  # Even longer episodes for more exploration time
 
-# PPO hyperparameters
-DISCOUNT_FACTOR = 0.9 # lower discount for more immediate rewards
-GAE_LAMBDA = 0.995 # higher means longer-term advantage estimation
-PPO_CLIP = 0.5 # higher clip means more exploration
-VALUE_COEF = 0.5 # higher means more weight on value loss, which results in more stable training
-ENTROPY_COEF = 0.5 # Entropy bonus to encourage exploration, higher means more exploration
+# PPO hyperparameters - TUNED FOR MAXIMUM EXPLORATION
+DISCOUNT_FACTOR = 0.97  # Higher = care more about future rewards = explore further
+GAE_LAMBDA = 0.95  # Lower = more focus on immediate advantage = less smoothing
+PPO_CLIP = 0.3  # Higher = allow bigger policy changes = more exploration
+VALUE_COEF = 0.5  # Balanced value loss
+ENTROPY_COEF = 0.001  # MUCH HIGHER = strong bonus for random actions = forced exploration
 
-# Knowledge pooling settings
-POOLING_FREQUENCY = 1  # Share knowledge every N episodes
-POOLING_ALPHA = 0.25    # Mixing coefficient for shared knowledge (0.25 = 25% shared, 75% individual)
+# Knowledge pooling settings - REDUCED to prevent premature convergence
+POOLING_FREQUENCY = 25  # Pool LESS often to let agents explore independently
+POOLING_ALPHA = 0.1     # Mix LESS knowledge (10% shared, 90% individual)
 
 # ============================================================================
 # CONFIGURATION SUMMARY
@@ -1072,36 +1072,36 @@ class PokemonEnv:
         }
         
         # ===================================================================
-        # HYPERPARAMETERS - Adjust these to guide learning
+        # HYPERPARAMETERS - EXPLORATION FOCUSED (Less penalties, more rewards)
         # ===================================================================
-        LOOP_PENALTY = 0.002              # Penalty for repeating same screen
-        REVISIT_PENALTY_RATE = 0.002      # Penalty growth per revisit
-        MAX_REVISIT_PENALTY = 0.15       # Cap on revisit penalty
-        NEW_STATE_BONUS = 5.0           # Reward for discovering new screen
-        DIALOG_PENALTY = 0.001            # Penalty for being in dialog
-        MENU_PENALTY = 0.001              # Penalty for being in menu
-        STUCK_PENALTY = 0.25             # Penalty for not moving
-        DIRECTION_CONSISTENCY_BONUS = 0.001  # Reward for moving same direction
-        MAP_DISCOVERY_BONUS = 1.0      # Reward for discovering new area
-        MAP_REVISIT_QUICK_PENALTY = 0.003 # Penalty for returning to area too soon
-        MAP_REVISIT_LATE_BONUS = 0.001    # Bonus for legitimate return
-        MAP_REVISIT_THRESHOLD = 5000     # Steps before return is "legitimate"
-        BATTLE_REWARD = 10.0            # Being in battle is good
-        BATTLE_DAMAGE_MULTIPLIER = 1.0  # Reward per HP damage dealt
-        BATTLE_VICTORY_WILD = 150.0     # Winning wild battle
-        BATTLE_VICTORY_TRAINER = 250.0  # Winning trainer battle
-        POKEMON_CAPTURE_BASE = 300.0    # Base reward for catching Pokemon
-        POKEMON_CAPTURE_MULTIPLIER = 1.5  # Multiplier for new Pokedex entries
-        BADGE_REWARD = 100.0            # Earning a gym badge
-        ITEM_GAIN_REWARD = 5.0          # Getting new items
-        ITEM_USE_PENALTY = 0.005          # Small penalty for using items
-        MONEY_GAIN_MULTIPLIER = 0.1     # Reward per money unit gained
-        MONEY_SPEND_PENALTY = 0.001      # Small penalty for spending
-        HEALING_BASE_REWARD = 0.005       # Base reward for healing
-        HEALING_HP_MULTIPLIER = 0.01    # Reward per HP healed
-        TALL_GRASS_BONUS = 0.01         # Small bonus for being in wild areas
-        MOVEMENT_BONUS = 0.01            # Small reward for any movement
-        TIME_PENALTY = 0.01            # Penalty per step (encourages efficiency)
+        LOOP_PENALTY = 0.5              # Reduced penalty for loops
+        REVISIT_PENALTY_RATE = 0.01      # Much gentler revisit penalty
+        MAX_REVISIT_PENALTY = 1.0        # Lower cap
+        NEW_STATE_BONUS = 20.0           # HUGE reward for new discoveries
+        DIALOG_PENALTY = 0.1             # Minimal dialog penalty
+        MENU_PENALTY = 0.1               # Minimal menu penalty
+        STUCK_PENALTY = 0.2              # Lower stuck penalty
+        DIRECTION_CONSISTENCY_BONUS = 0.05  # Small bonus for consistency
+        MAP_DISCOVERY_BONUS = 100.0      # MASSIVE reward for new maps
+        MAP_REVISIT_QUICK_PENALTY = 5.0  # Decent penalty for map flipping
+        MAP_REVISIT_LATE_BONUS = 2.0     # Good reward for returning later
+        MAP_REVISIT_THRESHOLD = 2000     # Can return sooner
+        BATTLE_REWARD = 0.75             # Higher battle reward
+        BATTLE_DAMAGE_MULTIPLIER = 2.0   # Higher damage reward
+        BATTLE_VICTORY_WILD = 200.0      # Higher victory reward
+        BATTLE_VICTORY_TRAINER = 350.0   # Much higher trainer reward
+        POKEMON_CAPTURE_BASE = 400.0     # Higher capture reward
+        POKEMON_CAPTURE_MULTIPLIER = 2.0 # Higher multiplier
+        BADGE_REWARD = 500.0             # HUGE badge reward
+        ITEM_GAIN_REWARD = 10.0          # Higher item reward
+        ITEM_USE_PENALTY = 0.05          # Minimal use penalty
+        MONEY_GAIN_MULTIPLIER = 0.2      # Higher money reward
+        MONEY_SPEND_PENALTY = 0.01       # Minimal spend penalty
+        HEALING_BASE_REWARD = 1.0        # Higher healing reward
+        HEALING_HP_MULTIPLIER = 0.05     # Higher HP reward
+        TALL_GRASS_BONUS = 0.05           # Much higher grass bonus
+        MOVEMENT_BONUS = 0.01             # Higher movement reward
+        TIME_PENALTY = 0.01             # MUCH lower time penalty
         
         # ===================================================================
         # STATE TRACKING
