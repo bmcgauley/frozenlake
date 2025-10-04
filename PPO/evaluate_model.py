@@ -45,12 +45,11 @@ class PokemonRedEvalEnv(gym.Env):
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize PyBoy
-        window_type = 'headless' if headless else 'SDL2'
+        # Initialize PyBoy (PyBoy 2.0 API)
+        window_type = 'null' if headless else 'SDL2'
         self.pyboy = PyBoy(
             self.rom_path,
-            window_type=window_type,
-            disable_input=False
+            window=window_type
         )
         
         if not headless:
@@ -58,13 +57,20 @@ class PokemonRedEvalEnv(gym.Env):
         else:
             self.pyboy.set_emulation_speed(0)  # Max speed
         
-        self.screen = self.pyboy.botsupport_manager().screen()
+        # Get screen interface (PyBoy 2.0 API)
+        self.screen = self.pyboy.screen
         
         # Action and observation spaces
         self.action_space = spaces.Discrete(9)
         self.observation_space = spaces.Box(
             low=0, high=255, shape=(120, 128, 3), dtype=np.uint8
         )
+        
+        # Action mapping (PyBoy 2.0 uses string button names)
+        self.action_map = [
+            'down', 'left', 'right', 'up',
+            'a', 'b', 'start', 'select', None  # None for no-op
+        ]
         
         # Tracking variables
         self.current_step = 0
@@ -87,8 +93,10 @@ class PokemonRedEvalEnv(gym.Env):
         """Reset environment."""
         super().reset(seed=seed)
         
-        # Reset PyBoy
-        self.pyboy.load_state(self.pyboy.save_state())
+        # Start from ROM boot (no save state)
+        # Run a few frames to stabilize
+        for _ in range(60):
+            self.pyboy.tick()
         
         # Reset tracking
         self.current_step = 0
@@ -100,6 +108,11 @@ class PokemonRedEvalEnv(gym.Env):
     
     def step(self, action):
         """Execute action."""
+        # Log the action being taken
+        action_name = self.action_map[action] if action < len(self.action_map) else 'none'
+        if action_name is None:
+            action_name = 'wait'
+        
         # Execute action
         self._take_action(action)
         
@@ -113,6 +126,11 @@ class PokemonRedEvalEnv(gym.Env):
         # Update step
         self.current_step += 1
         
+        # Print action every 10 steps to avoid spam
+        if self.current_step % 10 == 0:
+            pos = self._get_position()
+            print(f"Step {self.current_step:5d} | Action: {action_name:6s} | Pos: ({pos[0]:3d}, {pos[1]:3d}, Map:{pos[2]:3d}) | Reward: {reward:+.1f} | Total: {self.episode_reward:+.1f}")
+        
         # Check termination
         done = self.current_step >= 10000
         
@@ -120,24 +138,27 @@ class PokemonRedEvalEnv(gym.Env):
     
     def _take_action(self, action):
         """Execute action in emulator."""
-        actions = ['down', 'left', 'right', 'up', 'a', 'b', 'start', 'select', 'pass']
-        button = actions[action]
+        button = self.action_map[action]
         
-        if button != 'pass':
-            self.pyboy.send_input(button)
+        # Press button (PyBoy 2.0 API)
+        if button is not None:
+            self.pyboy.button_press(button)
         
         for _ in range(8):
             self.pyboy.tick()
         
-        if button != 'pass':
-            self.pyboy.send_input(button, release=True)
+        # Release button (PyBoy 2.0 API)
+        if button is not None:
+            self.pyboy.button_release(button)
         
         for _ in range(16):
             self.pyboy.tick()
     
     def _get_observation(self):
         """Get screen observation."""
-        screen = self.screen.screen_ndarray()
+        # PyBoy 2.0 API: Convert PIL Image to RGB numpy array
+        screen_image = self.pyboy.screen.image.convert('RGB')
+        screen = np.asarray(screen_image)
         
         # Downsample
         from skimage.transform import resize
@@ -149,14 +170,19 @@ class PokemonRedEvalEnv(gym.Env):
         
         return downsampled
     
+    def _get_position(self):
+        """Get current player position."""
+        x = self.pyboy.memory[self.PLAYER_X]
+        y = self.pyboy.memory[self.PLAYER_Y]
+        m = self.pyboy.memory[self.MAP_ID]
+        return (x, y, m)
+    
     def _simple_reward(self):
         """Calculate simple reward for evaluation."""
         reward = 0
         
         # Exploration
-        x = self.pyboy.memory[self.PLAYER_X]
-        y = self.pyboy.memory[self.PLAYER_Y]
-        m = self.pyboy.memory[self.MAP_ID]
+        x, y, m = self._get_position()
         pos = (m, x, y)
         
         if pos not in self.visited_coordinates:
@@ -178,7 +204,9 @@ class PokemonRedEvalEnv(gym.Env):
     
     def capture_screenshot(self, prefix='screenshot'):
         """Capture and save current screen."""
-        screen = self.screen.screen_ndarray()
+        # PyBoy 2.0 API: Convert PIL Image to RGB
+        screen_image = self.pyboy.screen.image.convert('RGB')
+        screen = np.asarray(screen_image)
         img = Image.fromarray(screen)
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -186,7 +214,7 @@ class PokemonRedEvalEnv(gym.Env):
         filepath = self.screenshot_dir / filename
         
         img.save(filepath)
-        print(f"📸 Screenshot saved: {filepath}")
+        print(f"Screenshot saved: {filepath}")
         
         return filepath
     
@@ -234,7 +262,7 @@ def run_demo(model_path, rom_path, num_steps=10000):
     obs, info = env.reset()
     
     # Run demo
-    print("\n🎮 Starting demo...")
+    print("\nStarting demo...")
     paused = False
     step = 0
     
@@ -268,7 +296,7 @@ def run_demo(model_path, rom_path, num_steps=10000):
             time.sleep(0.01)
     
     except KeyboardInterrupt:
-        print("\n\n⚠️ Demo interrupted by user")
+        print("\n\nDemo interrupted by user")
     
     finally:
         # Final screenshot
@@ -321,7 +349,7 @@ def run_evaluation(model_path, rom_path, num_episodes=10):
     episode_explorations = []
     
     # Run evaluation episodes
-    print(f"\n🔬 Running {num_episodes} evaluation episodes...\n")
+    print(f"\nRunning {num_episodes} evaluation episodes...\n")
     
     for episode in range(num_episodes):
         obs, info = env.reset()
@@ -394,7 +422,7 @@ def run_evaluation(model_path, rom_path, num_episodes=10):
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n📊 Results saved to: {results_path}")
+    print(f"\nResults saved to: {results_path}")
     
     env.close()
     
@@ -421,12 +449,12 @@ if __name__ == '__main__':
     
     # Verify model exists
     if not os.path.exists(args.model):
-        print(f"❌ ERROR: Model not found at {args.model}")
+        print(f"ERROR: Model not found at {args.model}")
         exit(1)
     
     # Verify ROM exists
     if not os.path.exists(args.rom):
-        print(f"❌ ERROR: ROM not found at {args.rom}")
+        print(f"ERROR: ROM not found at {args.rom}")
         exit(1)
     
     # Run appropriate mode
@@ -435,4 +463,4 @@ if __name__ == '__main__':
     else:
         run_evaluation(args.model, args.rom, args.episodes)
     
-    print("\n✅ Evaluation complete!")
+    print("\nEvaluation complete!")

@@ -152,33 +152,32 @@ class PokemonRedEnv(gym.Env):
             raise FileNotFoundError(f"Pokemon Red ROM not found at: {self.rom_path}")
         
         # Initialize PyBoy emulator
-        window_type = 'headless' if self.headless else 'SDL2'
+        window_type = 'null' if self.headless else 'SDL2'
         self.pyboy = PyBoy(
             self.rom_path,
-            window_type=window_type,
-            disable_input=False
+            window=window_type
         )
         
         # Set emulation speed to maximum (no frame rate limit)
         self.pyboy.set_emulation_speed(0)
         
-        # Get screen interface
-        self.screen = self.pyboy.botsupport_manager().screen()
+        # Get screen interface (updated API for PyBoy 2.0)
+        self.screen = self.pyboy.screen
         
         # Define action space: D-pad (4) + A/B (2) + Start/Select (2) + No-op (1)
         self.action_space = spaces.Discrete(9)
         
-        # Action mapping to PyBoy button presses
+        # Action mapping to PyBoy button names (PyBoy 2.0 uses strings)
         self.action_map = [
-            'down',      # 0
-            'left',      # 1
-            'right',     # 2
-            'up',        # 3
-            'a',         # 4
-            'b',         # 5
-            'start',     # 6
-            'select',    # 7
-            'pass'       # 8 - no operation
+            'down',    # 0
+            'left',    # 1
+            'right',   # 2
+            'up',      # 3
+            'a',       # 4
+            'b',       # 5
+            'start',   # 6
+            'select',  # 7
+            None       # 8 - no operation
         ]
         
         # Define observation space: downsampled RGB screen
@@ -191,15 +190,15 @@ class PokemonRedEnv(gym.Env):
             dtype=np.uint8
         )
         
-        # Initialize tracking variables
-        self.reset()
+        # Initialize milestone tracking (must be before reset())
+        self.milestones_achieved = set()
         
         # Create save directories
         self.screenshots_dir = Path(self.save_path) / 'screenshots'
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
         
-        # Milestone tracking
-        self.milestones_achieved = set()
+        # Initialize tracking variables by calling reset
+        self.reset()
         
         print(f"Environment initialized: {self.rom_path}")
         print(f"Action space: {self.action_space}")
@@ -209,21 +208,33 @@ class PokemonRedEnv(gym.Env):
         """
         Reset environment to initial state.
         Returns initial observation and info dict.
+        
+        Starts from ROM boot - agent must learn to navigate menus!
         """
         super().reset(seed=seed)
         
-        # Reset PyBoy to start of game
-        # Note: In production, you'd load a save state after choosing starter
-        # For now, we reset to game start
-        self.pyboy.load_state(self.pyboy.save_state())
+        # Soft reset PyBoy (restarts ROM from beginning)
+        # This resets the game to the title screen
+        for _ in range(60):  # Run a few frames to stabilize
+            self.pyboy.tick()
         
         # Initialize step counter
         self.current_step = 0
         
         # Initialize position tracking for exploration
         self.visited_coordinates = set()
+        self.visited_maps = set()  # Track unique maps visited
         self.last_position = None
         self.position_stuck_counter = 0
+        
+        # Screen hash tracking for TRUE stagnation detection
+        self.screen_hash_history = deque(maxlen=20)  # Last 20 screen hashes
+        self.last_screen_hash = None
+        self.same_screen_counter = 0
+        
+        # Action diversity tracking
+        self.action_history = deque(maxlen=10)  # Last 10 actions taken
+        self.last_action = None
         
         # Initialize menu tracking
         self.menu_time_counter = 0
@@ -290,6 +301,10 @@ class PokemonRedEnv(gym.Env):
             truncated: Whether episode exceeded max steps
             info: Additional information dictionary
         """
+        # Track action for diversity rewards
+        self.action_history.append(action)
+        self.last_action = action
+        
         # Execute action in emulator
         self._take_action(action)
         
@@ -324,17 +339,17 @@ class PokemonRedEnv(gym.Env):
         """
         button = self.action_map[action]
         
-        # Press button
-        if button != 'pass':
-            self.pyboy.send_input(button)
+        # Press button (if not no-op)
+        if button is not None:
+            self.pyboy.button_press(button)
         
         # Execute frames with button held (8 frames)
         for _ in range(8):
             self.pyboy.tick()
         
-        # Release button
-        if button != 'pass':
-            self.pyboy.send_input(button, release=True)
+        # Release button (if not no-op)
+        if button is not None:
+            self.pyboy.button_release(button)
         
         # Execute remaining frames (action_freq - 8 frames)
         for _ in range(self.action_freq - 8):
@@ -346,8 +361,10 @@ class PokemonRedEnv(gym.Env):
         
         Returns downsampled RGB image of Game Boy screen.
         """
-        # Get raw screen array (144, 160, 3)
-        screen_array = self.screen.screen_ndarray()
+        # Get raw screen array (144, 160, 3) - PyBoy 2.0 API
+        # Convert PIL Image to RGB numpy array (removes alpha channel if present)
+        screen_image = self.pyboy.screen.image.convert('RGB')
+        screen_array = np.asarray(screen_image)
         
         # Downsample to (120, 128, 3) for efficiency
         # Using skimage resize with anti-aliasing
@@ -359,6 +376,13 @@ class PokemonRedEnv(gym.Env):
         ).astype(np.uint8)
         
         return downsampled
+    
+    def _get_screen_hash(self):
+        """Get hash of current screen to detect if visuals changed."""
+        # Get screen as bytes and hash it
+        screen_image = self.pyboy.screen.image.convert('RGB')
+        screen_array = np.asarray(screen_image)
+        return hash(screen_array.tobytes())
     
     def _read_memory(self, address):
         """Read single byte from Game Boy memory."""
@@ -396,18 +420,67 @@ class PokemonRedEnv(gym.Env):
         """
         Calculate comprehensive reward based on multiple components.
         
+        EXPLORATION-FOCUSED REWARD STRUCTURE (based on P2 findings):
+        - Much higher rewards for discovery and progress
+        - Lower penalties to encourage experimentation
+        
         Reward Components:
-        1. Exploration: New coordinates visited (+1.0 per new location)
-        2. Battle Engagement: Starting battles (+0.5)
-        3. Damage Dealt: Damaging enemy Pokemon (+0.1 per HP)
-        4. Battle Victory: Winning battles (+2.0)
-        5. Pokemon Catching: Catching new Pokemon (+5.0)
-        6. Gym Badges: Obtaining badges (+20.0)
-        7. Death Penalty: Pokemon fainting (-5.0)
-        8. Stuck Penalty: Staying in same position (-0.1 per step)
-        9. Menu Penalty: Staying in menus too long (-0.05 per step)
+        1. Exploration: New coordinates visited (+20.0 per new location) ⬆️
+        2. Map Discovery: New map areas (+100.0) ⬆️
+        3. Battle Engagement: Starting battles (+5.0) ⬆️
+        4. Damage Dealt: Damaging enemy Pokemon (+2.0 per HP) ⬆️
+        5. Battle Victory: Winning battles (+200.0) ⬆️
+        6. Pokemon Catching: Catching new Pokemon (+400.0) ⬆️
+        7. Gym Badges: Obtaining badges (+500.0) ⬆️
+        8. Death Penalty: Pokemon fainting (-5.0)
+        9. Stuck Penalty: Staying in same position (-0.2 per step) ⬇️
+        10. Menu Penalty: Staying in menus too long (-0.01 per step) ⬇️
+        11. Time Penalty: Per-step cost (-0.01) ⬇️
         """
         total_reward = 0.0
+        
+        # Apply small time penalty to encourage action
+        time_penalty = -0.01
+        total_reward += time_penalty
+        
+        # ====================================================================
+        # 0. SCREEN STAGNATION DETECTION - Critical for title screen!
+        # ====================================================================
+        current_screen_hash = self._get_screen_hash()
+        
+        # Check if screen has changed at all
+        if current_screen_hash == self.last_screen_hash:
+            self.same_screen_counter += 1
+            # HARSH penalty for being on same screen
+            if self.same_screen_counter > 5:  # Just 5 steps of same screen
+                stagnation_penalty = -1.0  # HUGE penalty!
+                total_reward += stagnation_penalty
+                self.episode_rewards['stuck_penalty'] += stagnation_penalty
+        else:
+            # Screen changed! Small reward
+            screen_change_reward = 0.2
+            total_reward += screen_change_reward
+            self.episode_rewards['exploration'] += screen_change_reward
+            self.same_screen_counter = 0
+        
+        self.screen_hash_history.append(current_screen_hash)
+        self.last_screen_hash = current_screen_hash
+        
+        # ====================================================================
+        # 0.5. ACTION DIVERSITY REWARD - Encourage trying different buttons
+        # ====================================================================
+        if len(self.action_history) >= 3:
+            # Count unique actions in recent history
+            unique_actions = len(set(self.action_history))
+            # Reward diversity
+            if unique_actions >= 3:  # Using at least 3 different buttons
+                diversity_bonus = 0.1
+                total_reward += diversity_bonus
+                self.episode_rewards['exploration'] += diversity_bonus
+            elif unique_actions == 1:  # Spamming same button
+                diversity_penalty = -0.2
+                total_reward += diversity_penalty
+                self.episode_rewards['stuck_penalty'] += diversity_penalty
         
         # ====================================================================
         # 1. EXPLORATION REWARD - New coordinates visited
@@ -417,19 +490,39 @@ class PokemonRedEnv(gym.Env):
         current_map = self._read_memory(MAP_ID_ADDRESS)
         current_pos = (current_map, current_x, current_y)
         
+        # SEVERE penalty if stuck on title screen (map 0, pos 0,0)
+        if current_map == 0 and current_x == 0 and current_y == 0:
+            title_screen_penalty = -0.1  # Continuous penalty every step on title screen
+            total_reward += title_screen_penalty
+            self.episode_rewards['menu_penalty'] += title_screen_penalty
+        
         # Check if this is a new position
         if current_pos not in self.visited_coordinates:
             self.visited_coordinates.add(current_pos)
-            exploration_reward = 1.0
+            exploration_reward = 0.5  # ⬇️ Reduced - save bigger rewards for actual progress
             total_reward += exploration_reward
             self.episode_rewards['exploration'] += exploration_reward
+        
+        # IMPORTANT: Reward ANY movement to encourage constant action
+        if self.last_position is not None and self.last_position != current_pos:
+            movement_reward = 0.5  # ⬆️ Reward for moving at all!
+            total_reward += movement_reward
+            self.episode_rewards['exploration'] += movement_reward
+        
+        # Track new maps discovered
+        if current_map not in self.visited_maps:
+            self.visited_maps.add(current_map)
+            map_discovery_reward = 100.0  # ⬆️ Huge reward for discovering new areas
+            total_reward += map_discovery_reward
+            self.episode_rewards['exploration'] += map_discovery_reward
+            print(f"🗺️  NEW MAP DISCOVERED! ID: {current_map}")
         
         # Check if player is stuck in same position
         if self.last_position == current_pos:
             self.position_stuck_counter += 1
-            # Apply penalty after being stuck for 10 consecutive steps
-            if self.position_stuck_counter > 10:
-                stuck_penalty = -0.1
+            # Apply penalty immediately for being stuck
+            if self.position_stuck_counter > 3:  # ⬇️ Reduced threshold from 10 to 3
+                stuck_penalty = -0.5  # ⬆️ Increased penalty from -0.2 to discourage standing still
                 total_reward += stuck_penalty
                 self.episode_rewards['stuck_penalty'] += stuck_penalty
         else:
@@ -445,11 +538,10 @@ class PokemonRedEnv(gym.Env):
         # If in a menu (non-zero menu state)
         if current_menu != 0:
             self.menu_time_counter += 1
-            # Apply penalty after being in menu for 20 consecutive steps
-            if self.menu_time_counter > 20:
-                menu_penalty = -0.05
-                total_reward += menu_penalty
-                self.episode_rewards['menu_penalty'] += menu_penalty
+            # CONTINUOUS penalty for being in menu - gets worse over time
+            menu_penalty = -0.05 * (1 + self.menu_time_counter / 100.0)  # Escalating penalty
+            total_reward += menu_penalty
+            self.episode_rewards['menu_penalty'] += menu_penalty
         else:
             self.menu_time_counter = 0
         
@@ -460,7 +552,7 @@ class PokemonRedEnv(gym.Env):
         
         # Check if entering a battle (transition from 0 to non-zero)
         if current_battle != 0 and self.last_battle_type == 0:
-            battle_engage_reward = 0.5
+            battle_engage_reward = 5.0  # ⬆️ Increased from 0.5 to encourage battles
             total_reward += battle_engage_reward
             self.episode_rewards['battle_engaged'] += battle_engage_reward
         
@@ -476,7 +568,7 @@ class PokemonRedEnv(gym.Env):
             # If enemy HP decreased, reward damage dealt
             if self.last_enemy_hp > 0 and enemy_hp < self.last_enemy_hp:
                 damage = self.last_enemy_hp - enemy_hp
-                damage_reward = damage * 0.1
+                damage_reward = damage * 2.0  # ⬆️ Increased from 0.1 for stronger battle incentive
                 total_reward += damage_reward
                 self.episode_rewards['damage_dealt'] += damage_reward
                 self.damage_dealt_total += damage
@@ -500,7 +592,7 @@ class PokemonRedEnv(gym.Env):
             
             if party_alive:
                 # Won the battle
-                battle_win_reward = 2.0
+                battle_win_reward = 200.0  # ⬆️ Increased from 2.0 - HUGE victory reward!
                 total_reward += battle_win_reward
                 self.episode_rewards['battle_won'] += battle_win_reward
                 self.battles_won += 1
@@ -516,7 +608,7 @@ class PokemonRedEnv(gym.Env):
         
         if current_caught > self.last_caught_count:
             new_catches = current_caught - self.last_caught_count
-            catch_reward = new_catches * 5.0
+            catch_reward = new_catches * 400.0  # ⬆️ Increased from 5.0 - MASSIVE catch reward!
             total_reward += catch_reward
             self.episode_rewards['pokemon_caught'] += catch_reward
             self.pokemon_caught_count = current_caught
@@ -536,7 +628,7 @@ class PokemonRedEnv(gym.Env):
         
         if current_badges > self.last_badge_count:
             new_badges = current_badges - self.last_badge_count
-            badge_reward = new_badges * 20.0
+            badge_reward = new_badges * 500.0  # ⬆️ Increased from 20.0 - HUGE badge reward!
             total_reward += badge_reward
             self.episode_rewards['gym_badge'] += badge_reward
             self.badges_obtained = current_badges
@@ -609,7 +701,8 @@ class PokemonRedEnv(gym.Env):
             'battles_lost': self.battles_lost,
             'deaths': self.deaths,
             'episode_reward': self.episode_rewards['total'],
-            'milestones': len(self.milestones_achieved)
+            'milestones': len(self.milestones_achieved),
+            'reward_breakdown': self.episode_rewards  # 🔥 ADD REWARD BREAKDOWN FOR TENSORBOARD!
         }
     
     def _check_milestones(self):
@@ -647,8 +740,9 @@ class PokemonRedEnv(gym.Env):
         
         self.milestones_achieved.add(milestone_key)
         
-        # Get current screen
-        screen = self.screen.screen_ndarray()
+        # Get current screen (PyBoy 2.0 API) - convert to RGB
+        screen_image = self.pyboy.screen.image.convert('RGB')
+        screen = np.asarray(screen_image)
         
         # Save screenshot
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -715,9 +809,9 @@ class MilestoneCallback(BaseCallback):
     
     This callback:
     1. Saves model checkpoints periodically
-    2. Logs training metrics
+    2. Logs comprehensive training metrics to TensorBoard
     3. Tracks best model based on rewards
-    4. Enables swarm learning by saving weights for other agents
+    4. Logs all reward components for analysis
     """
     
     def __init__(self, save_freq, save_path, verbose=1):
@@ -728,6 +822,19 @@ class MilestoneCallback(BaseCallback):
         self.best_mean_reward = -np.inf
         self.episode_rewards = []
         self.episode_lengths = []
+        
+        # Tracking for detailed reward analysis
+        self.reward_components = {
+            'exploration': [],
+            'battle_won': [],
+            'battle_engaged': [],
+            'damage_dealt': [],
+            'pokemon_caught': [],
+            'gym_badge': [],
+            'death_penalty': [],
+            'stuck_penalty': [],
+            'menu_penalty': []
+        }
         
         # Tracking for visualization
         self.training_history = {
@@ -748,6 +855,17 @@ class MilestoneCallback(BaseCallback):
             if self.verbose > 0:
                 print(f"\nCheckpoint saved: {checkpoint_path}")
         
+        # Log reward components from the last step if available
+        if hasattr(self.locals.get('infos', [{}])[0], '__iter__'):
+            for info in self.locals.get('infos', []):
+                if 'episode' in info:
+                    # Log episode rewards breakdown if available
+                    if 'reward_breakdown' in info:
+                        breakdown = info['reward_breakdown']
+                        for component, value in breakdown.items():
+                            if component in self.reward_components:
+                                self.reward_components[component].append(value)
+        
         return True
     
     def _on_rollout_end(self):
@@ -762,6 +880,60 @@ class MilestoneCallback(BaseCallback):
             self.training_history['mean_reward'].append(mean_reward)
             self.training_history['episode_length'].append(mean_length)
             
+            # ===== LOG TO TENSORBOARD =====
+            # Log basic metrics
+            self.logger.record('custom/mean_episode_reward', mean_reward)
+            self.logger.record('custom/mean_episode_length', mean_length)
+            self.logger.record('custom/best_mean_reward', self.best_mean_reward)
+            
+            # Log reward components (averages over recent episodes)
+            for component, values in self.reward_components.items():
+                if len(values) > 0:
+                    mean_value = np.mean(values[-100:])  # Last 100 values
+                    self.logger.record(f'rewards/{component}', mean_value)
+            
+            # Log game-specific metrics from environment info
+            if len(self.model.ep_info_buffer) > 0:
+                # Try to extract custom metrics from episode info
+                recent_episodes = list(self.model.ep_info_buffer)[-10:]  # Last 10 episodes
+                
+                # Initialize aggregators
+                badges_total = []
+                pokemon_caught_total = []
+                pokemon_seen_total = []
+                battles_won_total = []
+                deaths_total = []
+                coordinates_explored_total = []
+                
+                for ep_info in recent_episodes:
+                    # Check if custom info exists
+                    if 'badges' in ep_info:
+                        badges_total.append(ep_info['badges'])
+                    if 'pokemon_caught' in ep_info:
+                        pokemon_caught_total.append(ep_info['pokemon_caught'])
+                    if 'pokemon_seen' in ep_info:
+                        pokemon_seen_total.append(ep_info['pokemon_seen'])
+                    if 'battles_won' in ep_info:
+                        battles_won_total.append(ep_info['battles_won'])
+                    if 'deaths' in ep_info:
+                        deaths_total.append(ep_info['deaths'])
+                    if 'coordinates_explored' in ep_info:
+                        coordinates_explored_total.append(ep_info['coordinates_explored'])
+                
+                # Log game progress metrics
+                if len(badges_total) > 0:
+                    self.logger.record('game/badges', np.mean(badges_total))
+                if len(pokemon_caught_total) > 0:
+                    self.logger.record('game/pokemon_caught', np.mean(pokemon_caught_total))
+                if len(pokemon_seen_total) > 0:
+                    self.logger.record('game/pokemon_seen', np.mean(pokemon_seen_total))
+                if len(battles_won_total) > 0:
+                    self.logger.record('game/battles_won', np.mean(battles_won_total))
+                if len(deaths_total) > 0:
+                    self.logger.record('game/deaths', np.mean(deaths_total))
+                if len(coordinates_explored_total) > 0:
+                    self.logger.record('game/coordinates_explored', np.mean(coordinates_explored_total))
+            
             # Save best model
             if mean_reward > self.best_mean_reward:
                 self.best_mean_reward = mean_reward
@@ -771,12 +943,13 @@ class MilestoneCallback(BaseCallback):
                     print(f"\nNew best model! Mean reward: {mean_reward:.2f}")
                     print(f"   Saved to: {best_model_path}")
             
-            # Log metrics
+            # Log metrics to console
             if self.verbose > 0:
                 print(f"\nTraining Update:")
                 print(f"  Timesteps: {self.num_timesteps}")
                 print(f"  Mean Reward: {mean_reward:.2f}")
                 print(f"  Mean Episode Length: {mean_length:.0f}")
+
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -807,112 +980,125 @@ ENV_CONFIG = {
     'save_screenshots': True
 }
 
-# Training hyperparameters
-NUM_ENVS = min(2, os.cpu_count())  # Use up to 2 parallel environments
-TOTAL_TIMESTEPS = 1_000_000  # 1 million steps
-SAVE_FREQ = 5_000  # Save checkpoint every 50k steps
-LEARNING_RATE = 3e-4
-N_STEPS = 2048  # Steps per environment before update
-BATCH_SIZE = 512
-N_EPOCHS = 1
-GAMMA = 0.999  # Discount factor
-GAE_LAMBDA = 0.95
+def main():
+    """Main training function."""
+    # Training hyperparameters
+    NUM_ENVS = min(3, os.cpu_count())  # Use up to 24 parallel environments
+    TOTAL_TIMESTEPS = 50_000  # 100k steps
+    SAVE_FREQ = 5_000  # Save checkpoint every 5k steps
+    LEARNING_RATE = 3e-4
+    N_STEPS = 2048  # Steps per environment before update
+    BATCH_SIZE = 512
+    N_EPOCHS = 1
+    GAMMA = 0.999  # Discount factor
+    GAE_LAMBDA = 0.95
 
-print(f"\nTraining Configuration:")
-print(f"  Parallel Environments: {NUM_ENVS}")
-print(f"  Total Timesteps: {TOTAL_TIMESTEPS:,}")
-print(f"  Learning Rate: {LEARNING_RATE}")
-print(f"  Steps per Update: {N_STEPS}")
-print(f"  Batch Size: {BATCH_SIZE}")
+    print(f"\nTraining Configuration:")
+    print(f"  Parallel Environments: {NUM_ENVS}")
+    print(f"  Total Timesteps: {TOTAL_TIMESTEPS:,}")
+    print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  Steps per Update: {N_STEPS}")
+    print(f"  Batch Size: {BATCH_SIZE}")
 
-# ============================================================================
-# MAIN TRAINING LOOP
-# ============================================================================
+    # ============================================================================
+    # MAIN TRAINING LOOP
+    # ============================================================================
 
-print(f"\nStarting Training...")
-print("=" * 80)
+    print(f"\nStarting Training...")
+    print("=" * 80)
 
-# Create parallel environments
-print(f"Creating {NUM_ENVS} parallel environments...")
-env = SubprocVecEnv([make_env(i, ENV_CONFIG) for i in range(NUM_ENVS)])
+    # Create parallel environments
+    print(f"Creating {NUM_ENVS} parallel environments...")
+    env = SubprocVecEnv([make_env(i, ENV_CONFIG) for i in range(NUM_ENVS)])
 
-print("Initializing PPO model...")
-# Create PPO model with CNN policy
-model = PPO(
-    'CnnPolicy',
-    env,
-    learning_rate=LEARNING_RATE,
-    n_steps=N_STEPS,
-    batch_size=BATCH_SIZE,
-    n_epochs=N_EPOCHS,
-    gamma=GAMMA,
-    gae_lambda=GAE_LAMBDA,
-    clip_range=0.2,
-    clip_range_vf=None,
-    ent_coef=0.01,  # Entropy coefficient for exploration
-    vf_coef=0.5,  # Value function coefficient
-    max_grad_norm=0.5,
-    use_sde=False,
-    sde_sample_freq=-1,
-    target_kl=None,
-    tensorboard_log=str(SESSION_PATH / 'tensorboard'),
-    policy_kwargs=dict(
-        features_extractor_kwargs=dict(features_dim=512)
-    ),
-    verbose=1,
-    seed=None,
-    device='auto'
-)
-
-print(f"Model initialized. Device: {model.device}")
-print(f"Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
-
-# Create callback
-callback = MilestoneCallback(
-    save_freq=SAVE_FREQ,
-    save_path=SESSION_PATH / 'checkpoints',
-    verbose=1
-)
-
-# Start training
-print("\n" + "=" * 80)
-print("TRAINING STARTED")
-print("=" * 80)
-start_time = time.time()
-
-try:
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=callback,
-        log_interval=10,
-        progress_bar=True
+    print("Initializing PPO model...")
+    # Create PPO model with CNN policy - EXPLORATION-FOCUSED HYPERPARAMETERS
+    model = PPO(
+        'CnnPolicy',
+        env,
+        learning_rate=LEARNING_RATE,
+        n_steps=N_STEPS,
+        batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS,
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        clip_range=0.3,  # ⬆️ Increased from 0.2 - allows bigger policy changes for exploration
+        clip_range_vf=None,
+        ent_coef=0.05,  # ⬆️ Increased from 0.01 - MUCH stronger exploration bonus!
+        vf_coef=0.5,  # Value function coefficient
+        max_grad_norm=0.5,
+        use_sde=False,
+        sde_sample_freq=-1,
+        target_kl=None,
+        tensorboard_log=str(SESSION_PATH / 'tensorboard'),
+        policy_kwargs=dict(
+            features_extractor_kwargs=dict(features_dim=512)
+        ),
+        verbose=1,
+        seed=None,
+        device='auto'
     )
-except KeyboardInterrupt:
-    print("\n\nTraining interrupted by user")
 
-# Training complete
-end_time = time.time()
-training_duration = end_time - start_time
+    print(f"Model initialized. Device: {model.device}")
+    print(f"Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
 
-print("\n" + "=" * 80)
-print("TRAINING COMPLETED")
-print("=" * 80)
-print(f"Duration: {training_duration / 3600:.2f} hours")
-print(f"Final model saved to: {SESSION_PATH}")
+    # Create callback
+    callback = MilestoneCallback(
+        save_freq=SAVE_FREQ,
+        save_path=SESSION_PATH / 'checkpoints',
+        verbose=1
+    )
 
-# Save final model
-final_model_path = SESSION_PATH / 'final_model.zip'
-model.save(final_model_path)
-print(f"Final model: {final_model_path}")
+    # Start training
+    print("\n" + "=" * 80)
+    print("TRAINING STARTED")
+    print("=" * 80)
+    start_time = time.time()
 
-# Save training history
-history_path = SESSION_PATH / 'training_history.json'
-with open(history_path, 'w') as f:
-    json.dump(callback.training_history, f, indent=2)
-print(f"Training history: {history_path}")
+    try:
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=callback,
+            log_interval=1,  # Log every update for more frequent TensorBoard data
+            progress_bar=True
+        )
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user")
 
-# Close environments
-env.close()
+    # Training complete
+    end_time = time.time()
+    training_duration = end_time - start_time
 
-print("\nTraining session complete!")
-print(f"View results with: tensorboard --logdir {SESSION_PATH / 'tensorboard'}")
+    print("\n" + "=" * 80)
+    print("TRAINING COMPLETED")
+    print("=" * 80)
+    print(f"Duration: {training_duration / 3600:.2f} hours")
+    print(f"Final model saved to: {SESSION_PATH}")
+
+    # Save final model
+    final_model_path = SESSION_PATH / 'final_model.zip'
+    model.save(final_model_path)
+    print(f"Final model: {final_model_path}")
+
+    # Save training history
+    history_path = SESSION_PATH / 'training_history.json'
+    with open(history_path, 'w') as f:
+        json.dump(callback.training_history, f, indent=2)
+    print(f"Training history: {history_path}")
+
+    # Close environments
+    env.close()
+
+    print("\nTraining session complete!")
+    print(f"View results with: tensorboard --logdir {SESSION_PATH / 'tensorboard'}")
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+if __name__ == '__main__':
+    # This is required for multiprocessing on Windows
+    from multiprocessing import freeze_support
+    freeze_support()
+    
+    main()
