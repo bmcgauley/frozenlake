@@ -339,7 +339,7 @@ class PokemonRedEnv(gym.Env):
         
         # CNN Input Debugging System - visualize what the model sees
         self.debug_cnn_input = config.get('debug_cnn_input', False)
-        self.cnn_save_frequency = config.get('cnn_save_frequency', 100)  # Save every N steps
+        self.cnn_save_frequency = config.get('cnn_save_frequency', 24)  # Save every N steps
         self.step_count = 0
         
         # Initialize tracking variables by calling reset
