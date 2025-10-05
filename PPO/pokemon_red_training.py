@@ -512,7 +512,7 @@ class PokemonRedEnv(gym.Env):
     def _add_status_bars(self, screen):
         """
         Add visual status bars as described in the proven methodology.
-        Overlays simple bars showing HP, levels, and exploration progress.
+        Overlays bars showing HP, levels, exploration progress, and REWARD.
         """
         # Create copy to modify
         screen_with_status = screen.copy()
@@ -522,22 +522,37 @@ class PokemonRedEnv(gym.Env):
         exploration_progress = self.screen_record.get_exploration_progress()
         unique_screens = exploration_progress['unique_screens']
         
-        # Add simple status bars in top-right area (visible but not intrusive)
-        # HP bar (assume 100 max for visualization)
+        # Get current episode reward for reward bar
+        current_episode_reward = self.episode_rewards.get('total', 0)
+        
+        # Add status bars in top-right area (8 pixels wide, clearly visible)
+        bar_x_start = 32
+        bar_width = 8
+        
+        # 1. HP bar (based on Pokemon levels) - WHITE
         hp_percentage = min(100, total_levels * 10) / 100  # Rough HP indicator from levels
-        hp_bar_width = int(8 * hp_percentage)  # 8 pixel wide bar
+        hp_bar_width = int(bar_width * hp_percentage)
         if hp_bar_width > 0:
-            screen_with_status[2:4, 32:32+hp_bar_width] = 255  # White HP bar
+            screen_with_status[2:4, bar_x_start:bar_x_start+hp_bar_width] = 255  # White HP bar
         
-        # Level progress bar  
-        level_bar_width = min(8, total_levels)  # Up to 8 pixels for levels
+        # 2. Level progress bar - LIGHT GRAY  
+        level_bar_width = min(bar_width, total_levels)  # Up to 8 pixels for levels
         if level_bar_width > 0:
-            screen_with_status[5:7, 32:32+level_bar_width] = 200  # Gray level bar
+            screen_with_status[5:7, bar_x_start:bar_x_start+level_bar_width] = 200  # Gray level bar
         
-        # Exploration progress bar (logarithmic scale for large numbers)
-        exploration_bar_width = min(8, int(np.log10(max(1, unique_screens))))  # Log scale
+        # 3. Exploration progress bar (logarithmic scale) - MEDIUM GRAY
+        exploration_bar_width = min(bar_width, int(np.log10(max(1, unique_screens))))  # Log scale
         if exploration_bar_width > 0:
-            screen_with_status[8:10, 32:32+exploration_bar_width] = 150  # Darker exploration bar
+            screen_with_status[8:10, bar_x_start:bar_x_start+exploration_bar_width] = 150  # Darker exploration bar
+        
+        # 4. **NEW: REWARD BAR** - Shows current episode reward - BRIGHT (like in video)
+        # Scale reward to bar width (adjust scale as needed)
+        reward_scale = max(1, abs(current_episode_reward) / 100)  # Scale down large rewards
+        reward_bar_width = min(bar_width, int(abs(current_episode_reward) / reward_scale))
+        if reward_bar_width > 0:
+            # Color based on reward: bright if positive, dim if negative
+            reward_color = 220 if current_episode_reward >= 0 else 80
+            screen_with_status[11:13, bar_x_start:bar_x_start+reward_bar_width] = reward_color
         
         return screen_with_status
     
@@ -578,18 +593,18 @@ class PokemonRedEnv(gym.Env):
             # Extract the 3 stacked frames
             frame1 = observation[:, :, 0]  # Oldest frame
             frame2 = observation[:, :, 1]  # Middle frame  
-            frame3 = observation[:, :, 2]  # Most recent frame
+            frame3 = observation[:, :, 2]  # Most recent frame (newest)
             
-            # Create a combined visualization
-            # Stack the 3 frames horizontally for comparison
-            combined_width = 40 * 3 + 2 * 5  # 3 frames + padding
-            combined_height = 36
+            # Create a combined visualization - Stack frames VERTICALLY (top to bottom)
+            # Top = newest (most recent), Bottom = oldest
+            combined_width = 40
+            combined_height = 36 * 3 + 2 * 5  # 3 frames + padding
             combined_image = np.zeros((combined_height, combined_width), dtype=np.uint8)
             
-            # Place frames side by side with padding
-            combined_image[:, 0:40] = frame1
-            combined_image[:, 45:85] = frame2  
-            combined_image[:, 90:130] = frame3
+            # Place frames vertically with padding - NEWEST at TOP
+            combined_image[0:36, :] = frame3      # Top: Current (newest)
+            combined_image[41:77, :] = frame2     # Middle: Frame -1  
+            combined_image[82:118, :] = frame1    # Bottom: Frame -2 (oldest)
             
             # Convert to RGB for text overlay
             combined_rgb = np.stack([combined_image] * 3, axis=-1)
@@ -607,25 +622,25 @@ class PokemonRedEnv(gym.Env):
             except:
                 font = ImageFont.load_default()
             
-            # Add labels and information
+            # Add labels and information - positioned for vertical layout
             draw.text((5, 5), f"Step: {step_count}", fill=(255, 255, 255), font=font)
-            draw.text((5, 20), "Frame -2", fill=(255, 255, 0), font=font)
-            draw.text((185, 20), "Frame -1", fill=(255, 255, 0), font=font)
-            draw.text((365, 20), "Current", fill=(255, 255, 0), font=font)
+            draw.text((5, 20), "Current", fill=(255, 255, 0), font=font)      # Top frame
+            draw.text((5, 175), "Frame -1", fill=(255, 255, 0), font=font)    # Middle frame
+            draw.text((5, 340), "Frame -2", fill=(255, 255, 0), font=font)    # Bottom frame
             
             if action_taken is not None:
                 action_names = ['DOWN', 'LEFT', 'RIGHT', 'UP', 'A', 'B', 'START', 'SELECT', 'NOOP']
                 action_name = action_names[action_taken] if action_taken < len(action_names) else f"ACT_{action_taken}"
-                draw.text((5, 35), f"Action: {action_name}", fill=(0, 255, 0), font=font)
+                draw.text((5, 385), f"Action: {action_name}", fill=(0, 255, 0), font=font)
             
             if reward is not None:
-                draw.text((5, 50), f"Reward: {reward:.3f}", fill=(255, 0, 255), font=font)
+                draw.text((5, 400), f"Reward: {reward:.3f}", fill=(255, 0, 255), font=font)
             
             # Add game state information
             total_levels = self._get_total_pokemon_levels()
             unique_screens = self.screen_record.get_exploration_progress()['unique_screens']
-            draw.text((5, 65), f"Levels: {total_levels}", fill=(0, 255, 255), font=font)
-            draw.text((5, 80), f"Unique Screens: {unique_screens}", fill=(0, 255, 255), font=font)
+            draw.text((5, 415), f"Levels: {total_levels}", fill=(0, 255, 255), font=font)
+            draw.text((5, 430), f"Unique Screens: {unique_screens}", fill=(0, 255, 255), font=font)
             
             # Save the debug image
             debug_filename = f"cnn_input_{step_count:06d}.png"
@@ -923,13 +938,15 @@ class PokemonRedEnv(gym.Env):
         estimated_max_hp = total_levels * 20  # Rough estimate
         estimated_current_hp = estimated_max_hp  # Assume full HP for simplicity
         
-        # Check for healing (HP increase)
+        # Check for healing (HP increase) - return only the incremental healing
+        healing_reward = 0
         if estimated_current_hp > self.last_party_hp:
             healing = estimated_current_hp - self.last_party_hp
-            self.total_healing_rew += healing * 0.01  # Small healing reward
+            healing_reward = healing * 0.01  # Small healing reward
+            self.total_healing_rew += healing_reward  # Track cumulative for info
         
         self.last_party_hp = estimated_current_hp
-        return self.total_healing_rew
+        return healing_reward  # 🔧 FIXED: Return only this step's reward, not cumulative
     
     def _update_max_op_level_reward(self):
         """Opponent level reward - encourages battling stronger opponents."""
@@ -1369,10 +1386,10 @@ ENV_CONFIG = {
     'cnn_save_frequency': 100,  # Save CNN debug frames every 50 steps
 }
 
-def main():
-    """Main training function."""
+def main(continue_training=False, model_path=None):
+    """Main training function with support for continuing from existing models."""
     # Training hyperparameters - BALANCED LEARNING SETTINGS
-    NUM_ENVS = min(6, os.cpu_count())  # Parallel environments
+    NUM_ENVS = min(3, os.cpu_count())  # Parallel environments
     TOTAL_TIMESTEPS = 1_000_000  # Learn game progression
     SAVE_FREQ = 5_000  # Save checkpoint every 5k steps
     LEARNING_RATE = 0.0001
@@ -1390,6 +1407,11 @@ def main():
     print(f"  Batch Size: {BATCH_SIZE}")
     print(f"  Gamma (discount): {GAMMA}")
     print(f"  GAE Lambda: {GAE_LAMBDA}")
+    
+    if continue_training and model_path:
+        print(f"  🔄 Continuing from: {model_path}")
+    else:
+        print(f"  🆕 Starting fresh training")
 
     # ============================================================================
     # MAIN TRAINING LOOP
@@ -1402,36 +1424,41 @@ def main():
     print(f"Creating {NUM_ENVS} parallel environments...")
     env = SubprocVecEnv([make_env(i, ENV_CONFIG) for i in range(NUM_ENVS)])
 
-    print("Initializing PPO model...")
-    # Create PPO model with CNN policy - BALANCED LEARNING HYPERPARAMETERS
-    model = PPO(
-        'CnnPolicy',
-        env,
-        learning_rate=LEARNING_RATE,
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        n_epochs=N_EPOCHS,
-        gamma=GAMMA, 
-        gae_lambda=GAE_LAMBDA, 
-        clip_range=0.02,  # ⬇️ REDUCED from 0.4 - more conservative policy updates
-        clip_range_vf=None, # No value function clipping
-        ent_coef=0.35,  # ⬆️ INCREASED from 0.15 - start higher to prevent collapse
-        # This allows early exploration but doesn't overwhelm game rewards
-        # 0.25 is moderate-high - enough exploration without entropy addiction
-        # Will be reduced over time via callback to allow strategy development
-        vf_coef=0.5,  # ⬆️ INCREASED from 0.3 - value function helps learn game strategy
-        max_grad_norm=0.5, # ⬇️ REDUCED from 0.8 - more stable training
-        use_sde=False, # 🔧 FIXED: Disable SDE for discrete actions (Pokemon uses discrete action space)
-        sde_sample_freq=-1, # No SDE
-        target_kl=None,  # Remove KL limit - allow reasonable policy changes
-        tensorboard_log=str(SESSION_PATH / 'tensorboard'),
-        policy_kwargs=dict(
-            features_extractor_kwargs=dict(features_dim=512)
-        ),
-        verbose=1,
-        seed=42,  # for reproducibility, set a specific seed here
-        device='auto' # use GPU if available (CUDA)
-    )
+    if continue_training and model_path and Path(model_path).exists():
+        print(f"Loading existing model from: {model_path}")
+        model = PPO.load(model_path, env=env)
+        print("✅ Model loaded successfully! Continuing training...")
+    else:
+        print("Initializing new PPO model...")
+        # Create PPO model with CNN policy - BALANCED LEARNING HYPERPARAMETERS
+        model = PPO(
+            'CnnPolicy',
+            env,
+            learning_rate=LEARNING_RATE,
+            n_steps=N_STEPS,
+            batch_size=BATCH_SIZE,
+            n_epochs=N_EPOCHS,
+            gamma=GAMMA, 
+            gae_lambda=GAE_LAMBDA, 
+            clip_range=0.02,  # ⬇️ REDUCED from 0.4 - more conservative policy updates
+            clip_range_vf=None, # No value function clipping
+            ent_coef=0.35,  # ⬆️ INCREASED from 0.15 - start higher to prevent collapse
+            # This allows early exploration but doesn't overwhelm game rewards
+            # 0.25 is moderate-high - enough exploration without entropy addiction
+            # Will be reduced over time via callback to allow strategy development
+            vf_coef=0.5,  # ⬆️ INCREASED from 0.3 - value function helps learn game strategy
+            max_grad_norm=0.5, # ⬇️ REDUCED from 0.8 - more stable training
+            use_sde=False, # 🔧 FIXED: Disable SDE for discrete actions (Pokemon uses discrete action space)
+            sde_sample_freq=-1, # No SDE
+            target_kl=None,  # Remove KL limit - allow reasonable policy changes
+            tensorboard_log=str(SESSION_PATH / 'tensorboard'),
+            policy_kwargs=dict(
+                features_extractor_kwargs=dict(features_dim=512)
+            ),
+            verbose=1,
+            seed=42,  # for reproducibility, set a specific seed here
+            device='auto' # use GPU if available (CUDA)
+        )
 
     print(f"Model initialized. Device: {model.device}")
     print(f"Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
@@ -1694,13 +1721,14 @@ if __name__ == '__main__':
         
         print(f"Available options:")
         print(f"  1. 🏋️  Start New Training Session")
-        print(f"  2. 🎯  Quick Demo (headless - stats only)")
-        print(f"  3. 🎮  Visual Demo (watch game window)")
+        print(f"  2. 🔄  Continue Training from Checkpoint")
+        print(f"  3. 🎯  Quick Demo (headless - stats only)")
+        print(f"  4. 🎮  Visual Demo (watch game window)")
         
         if available_models:
             print(f"\nAvailable trained models:")
             for i, model in enumerate(available_models):
-                print(f"  {i+4}. 📊 Demo: {model['name']}")
+                print(f"  {i+5}. 📊 Demo: {model['name']}")
         else:
             print(f"\n  No trained models found in ./sessions/")
         
@@ -1720,7 +1748,7 @@ if __name__ == '__main__':
                     main()
                     return
                 
-                elif choice == '2':
+                elif choice == '3':
                     if not available_models:
                         print("❌ No trained models available for demo!")
                         continue
@@ -1742,7 +1770,95 @@ if __name__ == '__main__':
                         print("❌ Invalid input!")
                     return
                 
+                elif choice == '4':
+                    # Continue training from checkpoint
+                    print(f"\n🔄 Continue training options:")
+                    print(f"  1. Continue from latest checkpoint")
+                    print(f"  2. Select specific checkpoint")
+                    
+                    continue_choice = input("Enter choice (1-2): ").strip()
+                    
+                    if continue_choice == '1':
+                        # Auto-find latest checkpoint
+                        checkpoint_dir = SESSION_PATH / 'checkpoints'
+                        if checkpoint_dir.exists():
+                            checkpoints = list(checkpoint_dir.glob('ppo_pokemon_*.zip'))
+                            if checkpoints:
+                                latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+                                print(f"🔄 Continuing from latest: {latest.name}")
+                                main(continue_training=True, model_path=str(latest))
+                            else:
+                                print("❌ No checkpoints found! Starting fresh training instead.")
+                                main()
+                        else:
+                            print("❌ No checkpoints found! Starting fresh training instead.")
+                            main()
+                    elif continue_choice == '2':
+                        # List all available checkpoints
+                        all_checkpoints = []
+                        sessions_dir = Path('./sessions')
+                        if sessions_dir.exists():
+                            for session_dir in sessions_dir.iterdir():
+                                if session_dir.is_dir():
+                                    checkpoint_dir = session_dir / 'checkpoints'
+                                    if checkpoint_dir.exists():
+                                        for checkpoint in checkpoint_dir.glob('ppo_pokemon_*.zip'):
+                                            all_checkpoints.append({
+                                                'path': str(checkpoint),
+                                                'name': f"{session_dir.name}/{checkpoint.name}",
+                                                'mtime': checkpoint.stat().st_mtime
+                                            })
+                        
+                        if not all_checkpoints:
+                            print("❌ No checkpoints found! Starting fresh training instead.")
+                            main()
+                            return
+                        
+                        # Sort by modification time (newest first)
+                        all_checkpoints.sort(key=lambda x: x['mtime'], reverse=True)
+                        
+                        print(f"\nAvailable checkpoints:")
+                        for i, checkpoint in enumerate(all_checkpoints[:10]):  # Show latest 10
+                            print(f"  {i+1}. {checkpoint['name']}")
+                        
+                        checkpoint_choice = input("Enter checkpoint number: ").strip()
+                        try:
+                            checkpoint_idx = int(checkpoint_choice) - 1
+                            if 0 <= checkpoint_idx < len(all_checkpoints):
+                                selected_checkpoint = all_checkpoints[checkpoint_idx]
+                                print(f"🔄 Continuing from: {selected_checkpoint['name']}")
+                                main(continue_training=True, model_path=selected_checkpoint['path'])
+                            else:
+                                print("❌ Invalid checkpoint selection!")
+                        except ValueError:
+                            print("❌ Invalid input!")
+                    else:
+                        print("❌ Invalid choice!")
+                    return
+                
                 elif choice == '3':
+                    if not available_models:
+                        print("❌ No trained models available for demo!")
+                        continue
+                    
+                    print(f"\n🎯 Select model for headless demo:")
+                    for i, model in enumerate(available_models):
+                        print(f"  {i+1}. {model['name']}")
+                    
+                    model_choice = input("Enter model number: ").strip()
+                    try:
+                        model_idx = int(model_choice) - 1
+                        if 0 <= model_idx < len(available_models):
+                            selected_model = available_models[model_idx]
+                            print(f"\n🎯 Running headless demo with {selected_model['name']}")
+                            demo_model(selected_model['path'], steps=1000, show_visual=False)
+                        else:
+                            print("❌ Invalid model selection!")
+                    except ValueError:
+                        print("❌ Invalid input!")
+                    return
+                
+                elif choice == '4':
                     if not available_models:
                         print("❌ No trained models available for demo!")
                         continue
@@ -1764,8 +1880,8 @@ if __name__ == '__main__':
                         print("❌ Invalid input!")
                     return
                 
-                elif choice.isdigit() and int(choice) >= 4:
-                    model_idx = int(choice) - 4
+                elif choice.isdigit() and int(choice) >= 5:
+                    model_idx = int(choice) - 5
                     if model_idx < len(available_models):
                         selected_model = available_models[model_idx]
                         print(f"\n🎮 Running demo with {selected_model['name']}")
@@ -1783,11 +1899,49 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"❌ Error: {e}")
     
-    # Launch menu by default, but allow direct training
-    if len(sys.argv) > 1 and sys.argv[1] == '--train':
-        # Direct training mode
-        print("🏋️  Starting direct training mode...")
-        main()
+    # Launch menu by default, but allow direct training and continuing
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--train':
+            # Direct training mode
+            print("🏋️  Starting direct training mode...")
+            main()
+        elif sys.argv[1] == '--continue':
+            # Continue training mode
+            continue_training = True
+            model_path = None
+            if len(sys.argv) > 2:
+                model_path = sys.argv[2]
+            else:
+                # Default to latest checkpoint in current session
+                checkpoint_dir = SESSION_PATH / 'checkpoints'
+                if checkpoint_dir.exists():
+                    checkpoints = list(checkpoint_dir.glob('ppo_pokemon_*.zip'))
+                    if checkpoints:
+                        # Sort by modification time, get latest
+                        latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+                        model_path = str(latest)
+                        print(f"Found latest checkpoint: {model_path}")
+                    else:
+                        print("No checkpoints found in current session. Starting fresh training.")
+                        continue_training = False
+            
+            print("🔄 Starting continued training mode...")
+            main(continue_training=continue_training, model_path=model_path)
+        elif sys.argv[1] == '--help' or sys.argv[1] == '-h':
+            print("\nPokemon Red PPO Training")
+            print("Usage:")
+            print("  python pokemon_red_training.py                    # Interactive menu")
+            print("  python pokemon_red_training.py --train            # Start fresh training")
+            print("  python pokemon_red_training.py --continue         # Continue from latest checkpoint")
+            print("  python pokemon_red_training.py --continue [path]  # Continue from specific model")
+            print("\nExample:")
+            print("  python pokemon_red_training.py --continue sessions/session_20241220_143022/checkpoints/ppo_pokemon_50000.zip")
+            print("")
+            sys.exit(0)
+        else:
+            print(f"Unknown argument: {sys.argv[1]}")
+            print("Use --help for usage information.")
+            sys.exit(1)
     else:
         # Interactive menu mode
         show_menu()
