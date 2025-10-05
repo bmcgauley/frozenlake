@@ -259,9 +259,12 @@ class PokemonRedEnv(gym.Env):
             raise FileNotFoundError(f"Pokemon Red ROM not found at: {self.rom_path}")
         
         # Initialize PyBoy emulator
-        # Force headless mode on Windows to avoid SDL2 dependency issues
+        # Check if this is a demo mode that needs visuals
+        force_visual = config.get('force_visual', False)
+        
+        # Force headless mode on Windows for training, but allow visuals for demos
         import platform
-        if platform.system() == 'Windows':
+        if platform.system() == 'Windows' and not force_visual:
             self.headless = True
         
         window_type = 'null' if self.headless else 'SDL2'
@@ -269,6 +272,11 @@ class PokemonRedEnv(gym.Env):
         # Suppress SDL2 warnings
         import warnings
         warnings.filterwarnings('ignore', message='Unable to preload all dependencies for SDL2')
+        
+        # Configure SDL2 for better window visibility on Windows
+        if not self.headless:
+            os.environ['SDL_VIDEODRIVER'] = 'windows'  # Use Windows native driver
+            os.environ['SDL_VIDEO_WINDOW_POS'] = '100,100'  # Position window
         
         self.pyboy = PyBoy(
             self.rom_path,
@@ -1556,31 +1564,44 @@ def main(continue_training=False, model_path=None):
     print("Press Ctrl+C to stop the demo early")
     
     # Launch demo automatically
-    demo_model(final_model_path, steps=2000)
+    demo_model(final_model_path, show_visual=True, max_minutes=5)
 
-def demo_model(model_path, steps=1000, show_visual=True):
+def demo_model(model_path, show_visual=True, max_minutes=None):
     """
-    Demo the trained model playing the game.
+    Live demo of the trained model playing Pokemon Red.
+    
+    This is a pure demonstration mode - no training, no step limits,
+    just watch the AI play the game naturally until you stop it.
     
     Args:
         model_path: Path to the trained model
-        steps: Number of steps to run
-        show_visual: Whether to show the game window
+        show_visual: Whether to show the game window (should be True for demos)
+        max_minutes: Optional time limit in minutes (None = no limit)
     """
-    print(f"\n🎮 DEMO MODE - Showing what the model learned!")
+    print(f"\n🎮 LIVE DEMO MODE - Watch the AI play Pokemon Red!")
     print(f"Model: {model_path}")
-    print(f"Steps: {steps}")
     print(f"Visual: {'ON' if show_visual else 'OFF'}")
+    if max_minutes:
+        print(f"Time Limit: {max_minutes} minutes")
+    else:
+        print(f"Time Limit: None (press Ctrl+C to stop)")
     print("-" * 60)
     
-    # Create demo environment (with or without visuals)
+    if not show_visual:
+        print("⚠️  WARNING: Visual demo with show_visual=False doesn't make sense!")
+        print("   Enabling visuals for proper demo experience...")
+        show_visual = True
+    
+    # Create demo environment - ALWAYS with visuals for demo
     demo_config = {
         'rom_path': ROM_PATH,
-        'headless': not show_visual,  # Show window if show_visual is True
+        'headless': False,  # Always show window for demos
+        'force_visual': True,  # Override Windows headless forcing
         'action_freq': 24,
-        'max_steps': steps,
+        'max_steps': 999999,  # Very high limit, essentially no limit
         'save_path': './demo_temp',
-        'save_screenshots': False
+        'save_screenshots': False,
+        'session_path': './demo_temp'  # Separate demo session
     }
     
     try:
@@ -1592,92 +1613,136 @@ def demo_model(model_path, steps=1000, show_visual=True):
         model = PPO.load(model_path)
         print("✅ Model loaded successfully!")
         
+        # Verify PyBoy window state
+        if hasattr(env.pyboy, 'window_type'):
+            print(f"🖼️  PyBoy window type: {env.pyboy.window_type}")
+        else:
+            print(f"🖼️  PyBoy window type: {'Visual' if not env.headless else 'Headless'}")
+        
+        if not env.headless:
+            print("🎮 PyBoy visual window should now be visible!")
+            print("   If you don't see it, check your taskbar or try Alt+Tab")
+            print("   The window title should be 'PyBoy'")
+            
+            # Try to bring window to front (Windows-specific)
+            try:
+                import platform
+                if platform.system() == 'Windows':
+                    import time
+                    time.sleep(0.5)  # Let window initialize
+                    print("   Attempting to bring PyBoy window to front...")
+                    # This requires pywin32, but let's try a basic approach
+                    import subprocess
+                    subprocess.run(['powershell', '-Command', 
+                                  'Add-Type -AssemblyName Microsoft.VisualBasic; ' +
+                                  '[Microsoft.VisualBasic.Interaction]::AppActivate("PyBoy")'], 
+                                  capture_output=True)
+            except:
+                pass  # Window focus is optional
+        else:
+            print("⚠️  Warning: Running in headless mode (no visual window)")
+        
         # Reset environment
         obs, info = env.reset()
         
-        # Demo statistics
+        # Demo statistics (just for interest)
         total_reward = 0
         action_counts = {i: 0 for i in range(9)}
         action_names = ['DOWN', 'LEFT', 'RIGHT', 'UP', 'A', 'B', 'START', 'SELECT', 'WAIT']
         
-        print(f"\n🚀 Starting demo run...")
-        if show_visual:
-            print("   Watch the game window!")
-        print("   Action stats will be shown every 100 steps")
+        print(f"\n🚀 Starting live demo...")
+        print(f"   Watch the PyBoy game window!")
+        print(f"   Stats will be shown every 500 actions")
+        print(f"   Press Ctrl+C to stop the demo")
+        print("-" * 60)
         
-        # Run demo
-        for step in range(steps):
-            # Get action from trained model (deterministic = best action)
-            action, _states = model.predict(obs, deterministic=True)
+        import time
+        start_time = time.time()
+        step = 0
+        
+        # Run demo - INFINITE LOOP until user stops
+        while True:
+            # Check time limit if specified
+            if max_minutes:
+                elapsed_minutes = (time.time() - start_time) / 60
+                if elapsed_minutes >= max_minutes:
+                    print(f"\n⏰ Time limit reached ({max_minutes} minutes)")
+                    break
+            
+            # Get action from trained model - use some randomness for natural behavior
+            action, _states = model.predict(obs, deterministic=False)
             action = int(action)
             
-            # Track action
+            # Track action for stats
             action_counts[action] += 1
+            step += 1
             
-            # Take step
+            # Take step in the game
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             
-            # Print progress every 100 steps
-            if (step + 1) % 100 == 0:
+            # Print stats every 500 steps (not too frequently)
+            if step % 500 == 0:
+                elapsed_time = time.time() - start_time
+                minutes = int(elapsed_time // 60)
+                seconds = int(elapsed_time % 60)
+                
                 # Calculate action distribution
                 total_actions = sum(action_counts.values())
                 top_actions = sorted(action_counts.items(), key=lambda x: x[1], reverse=True)[:3]
                 action_dist = " | ".join([f"{action_names[act]}:{count*100/total_actions:.1f}%" 
                                         for act, count in top_actions])
                 
-                print(f"Step {step+1:4d}/{steps} | Reward: {total_reward:+7.1f} | Top Actions: {action_dist}")
+                print(f"⏱️  {minutes:02d}:{seconds:02d} | Actions: {step:5d} | Top: {action_dist}")
             
-            # Check if episode ended
+            # If episode ends naturally, just continue (don't reset)
+            # This lets the AI deal with game over states naturally
             if terminated or truncated:
-                print(f"\n🏁 Episode ended at step {step+1}")
+                print(f"🔄 Episode transition at step {step} (continuing...)")
                 obs, info = env.reset()
-                break
             
-            # Small delay for visual viewing
-            if show_visual:
-                time.sleep(0.02)  # 50 FPS for comfortable viewing
+            # Comfortable viewing pace - not too fast
+            time.sleep(0.1)  # 10 FPS for easy watching
         
         # Final statistics
-        print(f"\n" + "=" * 60)
-        print(f"DEMO COMPLETE!")
-        print(f"" + "=" * 60)
-        print(f"Total Steps: {step + 1}")
-        print(f"Total Reward: {total_reward:.2f}")
-        print(f"Average Reward per Step: {total_reward/(step+1):.3f}")
+        elapsed_time = time.time() - start_time
+        minutes = int(elapsed_time // 60)
+        seconds = int(elapsed_time % 60)
         
-        print(f"\nFinal Action Distribution:")
+        print(f"\n" + "=" * 60)
+        print(f"DEMO SUMMARY")
+        print(f"" + "=" * 60)
+        print(f"Duration: {minutes:02d}:{seconds:02d}")
+        print(f"Total Actions: {step}")
+        print(f"Actions per Minute: {step/(elapsed_time/60):.1f}")
+        
+        print(f"\nAction Distribution:")
         total_actions = sum(action_counts.values())
         for i, name in enumerate(action_names):
             count = action_counts[i]
             pct = (count / total_actions * 100) if total_actions > 0 else 0
-            bar_length = int(pct / 2)  # Scale for display
-            bar = "█" * bar_length + "░" * (50 - bar_length)
-            print(f"  {name:6s}: {count:4d} ({pct:5.1f}%) {bar}")
+            if pct > 1:  # Only show actions used more than 1%
+                bar_length = int(pct / 2)
+                bar = "█" * bar_length
+                print(f"  {name:6s}: {pct:5.1f}% {bar}")
         
-        # Analyze behavior
-        most_used_action = max(action_counts.items(), key=lambda x: x[1])
-        most_used_pct = most_used_action[1] / total_actions * 100
-        
-        if most_used_pct > 80:
-            print(f"\n⚠️  WARNING: Policy may have collapsed!")
-            print(f"   {action_names[most_used_action[0]]} used {most_used_pct:.1f}% of the time")
-        elif most_used_pct > 50:
-            print(f"\n🤔 Model has strong preference for {action_names[most_used_action[0]]} ({most_used_pct:.1f}%)")
-        else:
-            print(f"\n✅ Healthy action diversity! No single action dominates.")
-        
-        # Close environment
+        # Close environment cleanly
         env.close()
         
     except KeyboardInterrupt:
-        print(f"\n\n⏹️  Demo interrupted by user")
-        env.close()
+        print(f"\n\n⏹️  Demo stopped by user")
+        print(f"   Total actions taken: {step if 'step' in locals() else 0}")
+        try:
+            env.close()
+        except:
+            pass
         
     except Exception as e:
         print(f"\n❌ Demo failed: {e}")
+        import traceback
+        traceback.print_exc()
         
-    print(f"\nDemo finished! 🎉")
+    print(f"\nDemo session ended! 🎉")
 
 
 # ============================================================================
@@ -1722,13 +1787,13 @@ if __name__ == '__main__':
         print(f"Available options:")
         print(f"  1. 🏋️  Start New Training Session")
         print(f"  2. 🔄  Continue Training from Checkpoint")
-        print(f"  3. 🎯  Quick Demo (headless - stats only)")
-        print(f"  4. 🎮  Visual Demo (watch game window)")
+        print(f"  3. 🎯  Statistics Demo (no visuals - action stats)")
+        print(f"  4. 🎮  Live Visual Demo (watch AI play Pokemon Red)")
         
         if available_models:
             print(f"\nAvailable trained models:")
             for i, model in enumerate(available_models):
-                print(f"  {i+5}. 📊 Demo: {model['name']}")
+                print(f"  {i+5}. 🎮 Live Demo: {model['name']}")
         else:
             print(f"\n  No trained models found in ./sessions/")
         
@@ -1753,7 +1818,7 @@ if __name__ == '__main__':
                         print("❌ No trained models available for demo!")
                         continue
                     
-                    print(f"\n🎯 Select model for headless demo:")
+                    print(f"\n🎯 Select model for statistics demo (no visuals):")
                     for i, model in enumerate(available_models):
                         print(f"  {i+1}. {model['name']}")
                     
@@ -1762,8 +1827,8 @@ if __name__ == '__main__':
                         model_idx = int(model_choice) - 1
                         if 0 <= model_idx < len(available_models):
                             selected_model = available_models[model_idx]
-                            print(f"\n🎯 Running headless demo with {selected_model['name']}")
-                            demo_model(selected_model['path'], steps=1000, show_visual=False)
+                            print(f"\n🎯 Running statistics demo with {selected_model['name']}")
+                            demo_model(selected_model['path'], show_visual=False, max_minutes=3)
                         else:
                             print("❌ Invalid model selection!")
                     except ValueError:
@@ -1841,7 +1906,7 @@ if __name__ == '__main__':
                         print("❌ No trained models available for demo!")
                         continue
                     
-                    print(f"\n🎯 Select model for headless demo:")
+                    print(f"\n🎯 Select model for statistics demo (no visuals):")
                     for i, model in enumerate(available_models):
                         print(f"  {i+1}. {model['name']}")
                     
@@ -1850,8 +1915,8 @@ if __name__ == '__main__':
                         model_idx = int(model_choice) - 1
                         if 0 <= model_idx < len(available_models):
                             selected_model = available_models[model_idx]
-                            print(f"\n🎯 Running headless demo with {selected_model['name']}")
-                            demo_model(selected_model['path'], steps=1000, show_visual=False)
+                            print(f"\n🎯 Running statistics demo with {selected_model['name']}")
+                            demo_model(selected_model['path'], show_visual=False, max_minutes=3)
                         else:
                             print("❌ Invalid model selection!")
                     except ValueError:
@@ -1863,7 +1928,7 @@ if __name__ == '__main__':
                         print("❌ No trained models available for demo!")
                         continue
                     
-                    print(f"\n🎮 Select model for visual demo:")
+                    print(f"\n🎮 Select model for live visual demo:")
                     for i, model in enumerate(available_models):
                         print(f"  {i+1}. {model['name']}")
                     
@@ -1872,8 +1937,8 @@ if __name__ == '__main__':
                         model_idx = int(model_choice) - 1
                         if 0 <= model_idx < len(available_models):
                             selected_model = available_models[model_idx]
-                            print(f"\n🎮 Running visual demo with {selected_model['name']}")
-                            demo_model(selected_model['path'], steps=2000, show_visual=True)
+                            print(f"\n🎮 Running live visual demo with {selected_model['name']}")
+                            demo_model(selected_model['path'], show_visual=True, max_minutes=None)
                         else:
                             print("❌ Invalid model selection!")
                     except ValueError:
@@ -1885,7 +1950,7 @@ if __name__ == '__main__':
                     if model_idx < len(available_models):
                         selected_model = available_models[model_idx]
                         print(f"\n🎮 Running demo with {selected_model['name']}")
-                        demo_model(selected_model['path'], steps=2000, show_visual=True)
+                        demo_model(selected_model['path'], show_visual=True, max_minutes=None)
                         return
                     else:
                         print("❌ Invalid selection!")
