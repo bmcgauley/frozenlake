@@ -32,32 +32,81 @@ Architecture:
 """
 
 import os
-import numpy as np
-import gymnasium as gym
-from gymnasium import spaces
-import torch
-import time
-from datetime import datetime
-import json
-from collections import deque
-from PIL import Image
-import matplotlib.pyplot as plt
-from pathlib import Path
+import warnings
+import sys
+import io
+from contextlib import redirect_stderr
 
-# Import PyBoy for Game Boy emulation
-from pyboy import PyBoy
+# Set TensorFlow environment variables before any TF imports
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN optimizations warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'   # Suppress TensorFlow info and warning messages
 
-# Import stable-baselines3 for PPO algorithm
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.monitor import Monitor
+# Suppress warnings that can be caught by Python's warning system
+warnings.filterwarnings('ignore', message='Unable to preload all dependencies for SDL2_ttf')
+warnings.filterwarnings('ignore', message='Unable to preload all dependencies for SDL2_image')
+warnings.filterwarnings('ignore', message='Gym has been unmaintained since 2022')
+warnings.filterwarnings('ignore', category=UserWarning, module='gym')
 
-# Import preprocessing utilities
-from skimage.transform import resize
+# Create a stderr filter to catch gym warnings that bypass the warning system
+class StderrFilter:
+    def __init__(self):
+        self.original_stderr = sys.stderr
+        self.buffer = io.StringIO()
+        
+    def write(self, text):
+        # Filter out gym deprecation messages
+        if "Gym has been unmaintained since 2022" not in text and \
+           "Please upgrade to Gymnasium" not in text and \
+           "Users of this version of Gym should be able to simply replace" not in text and \
+           "See the migration guide" not in text:
+            self.original_stderr.write(text)
+            
+    def flush(self):
+        self.original_stderr.flush()
+        
+    def close(self):
+        # Delegate close to original stderr
+        if hasattr(self.original_stderr, 'close'):
+            self.original_stderr.close()
+            
+    def __getattr__(self, name):
+        # Delegate any other attributes to original stderr
+        return getattr(self.original_stderr, name)
 
-# Import custom screen state tracker
-from screen_state_tracker import ScreenStateTracker
+# Apply stderr filter during imports
+sys.stderr = StderrFilter()
+
+try:
+    import numpy as np
+    import gymnasium as gym
+    from gymnasium import spaces
+    import torch
+    import time
+    from datetime import datetime
+    import json
+    from collections import deque
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    # Import PyBoy for Game Boy emulation
+    from pyboy import PyBoy
+
+    # Import stable-baselines3 for PPO algorithm (this triggers the gym warning)
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import SubprocVecEnv
+    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.monitor import Monitor
+
+    # Import preprocessing utilities
+    from skimage.transform import resize
+
+    # Import custom screen state tracker
+    from screen_state_tracker import ScreenStateTracker
+
+finally:
+    # Restore original stderr
+    sys.stderr = sys.stderr.original_stderr
 
 print("=" * 80)
 print("POKEMON RED RL - SCREEN-BASED EXPLORATION AGENT")
@@ -142,6 +191,7 @@ class ScreenRecord:
 PLAYER_X_ADDRESS = 0xD362
 PLAYER_Y_ADDRESS = 0xD361
 MAP_ID_ADDRESS = 0xD35E
+PLAYER_NAME_ADDRESS = 0xD158          # Player name (7 bytes)
 
 # Pokemon party - Essential for level-based rewards
 PARTY_COUNT_ADDRESS = 0xD163          # Number of Pokemon in party (1 byte)
@@ -209,10 +259,21 @@ class PokemonRedEnv(gym.Env):
             raise FileNotFoundError(f"Pokemon Red ROM not found at: {self.rom_path}")
         
         # Initialize PyBoy emulator
+        # Force headless mode on Windows to avoid SDL2 dependency issues
+        import platform
+        if platform.system() == 'Windows':
+            self.headless = True
+        
         window_type = 'null' if self.headless else 'SDL2'
+        
+        # Suppress SDL2 warnings
+        import warnings
+        warnings.filterwarnings('ignore', message='Unable to preload all dependencies for SDL2')
+        
         self.pyboy = PyBoy(
             self.rom_path,
-            window=window_type
+            window=window_type,
+            debug=False  # Disable debug mode to reduce warnings
         )
         
         # Set emulation speed to maximum (no frame rate limit)
@@ -265,9 +326,21 @@ class PokemonRedEnv(gym.Env):
         # Initialize milestone tracking
         self.milestones_achieved = set()
         
-        # Create save directories
-        self.screenshots_dir = Path(self.save_path) / 'screenshots'
+        # Create save directories - organize by env rank if provided
+        env_rank = config.get('env_rank', 0)
+        if env_rank > 0:
+            self.screenshots_dir = Path(self.save_path) / f'screenshots_env_{env_rank}'
+            self.cnn_debug_dir = Path(self.save_path) / f'cnn_debug_env_{env_rank}'
+        else:
+            self.screenshots_dir = Path(self.save_path) / 'screenshots'
+            self.cnn_debug_dir = Path(self.save_path) / 'cnn_debug'
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self.cnn_debug_dir.mkdir(parents=True, exist_ok=True)
+        
+        # CNN Input Debugging System - visualize what the model sees
+        self.debug_cnn_input = config.get('debug_cnn_input', False)
+        self.cnn_save_frequency = config.get('cnn_save_frequency', 100)  # Save every N steps
+        self.step_count = 0
         
         # Initialize tracking variables by calling reset
         self.reset()
@@ -369,6 +442,10 @@ class PokemonRedEnv(gym.Env):
         
         # Get info dictionary
         info = self._get_info()
+        
+        # Save CNN debug visualization (what the model actually sees)
+        self.step_count += 1
+        self._save_cnn_debug_visualization(observation, self.step_count, action, reward)
         
         # Take periodic screenshots for monitoring
         if self.save_screenshots and self.current_step % 1000 == 0:
@@ -474,6 +551,138 @@ class PokemonRedEnv(gym.Env):
     def _read_memory(self, address):
         """Read single byte from Game Boy memory."""
         return self.pyboy.memory[address]
+    
+    def _save_cnn_debug_visualization(self, observation, step_count, action_taken=None, reward=None):
+        """
+        Save visualization of exactly what the CNN sees.
+        
+        This creates a debug image showing:
+        - The 3 stacked grayscale frames side by side
+        - Status bars overlaid
+        - Step information and game state
+        
+        Args:
+            observation: The processed observation that goes to the CNN (36x40x3)
+            step_count: Current step number
+            action_taken: Action that was taken (optional)
+            reward: Reward received (optional)
+        """
+        if not self.debug_cnn_input:
+            return
+            
+        # Only save every N steps to avoid too many files
+        if step_count % self.cnn_save_frequency != 0:
+            return
+            
+        try:
+            # Extract the 3 stacked frames
+            frame1 = observation[:, :, 0]  # Oldest frame
+            frame2 = observation[:, :, 1]  # Middle frame  
+            frame3 = observation[:, :, 2]  # Most recent frame
+            
+            # Create a combined visualization
+            # Stack the 3 frames horizontally for comparison
+            combined_width = 40 * 3 + 2 * 5  # 3 frames + padding
+            combined_height = 36
+            combined_image = np.zeros((combined_height, combined_width), dtype=np.uint8)
+            
+            # Place frames side by side with padding
+            combined_image[:, 0:40] = frame1
+            combined_image[:, 45:85] = frame2  
+            combined_image[:, 90:130] = frame3
+            
+            # Convert to RGB for text overlay
+            combined_rgb = np.stack([combined_image] * 3, axis=-1)
+            
+            # Scale up for better visibility (4x scale)
+            from PIL import Image, ImageDraw, ImageFont
+            pil_image = Image.fromarray(combined_rgb).resize((combined_width * 4, combined_height * 4), Image.NEAREST)
+            
+            # Add text overlay with debug information
+            draw = ImageDraw.Draw(pil_image)
+            
+            # Try to use a font, fall back to default if not available
+            try:
+                font = ImageFont.truetype("arial.ttf", 12)
+            except:
+                font = ImageFont.load_default()
+            
+            # Add labels and information
+            draw.text((5, 5), f"Step: {step_count}", fill=(255, 255, 255), font=font)
+            draw.text((5, 20), "Frame -2", fill=(255, 255, 0), font=font)
+            draw.text((185, 20), "Frame -1", fill=(255, 255, 0), font=font)
+            draw.text((365, 20), "Current", fill=(255, 255, 0), font=font)
+            
+            if action_taken is not None:
+                action_names = ['DOWN', 'LEFT', 'RIGHT', 'UP', 'A', 'B', 'START', 'SELECT', 'NOOP']
+                action_name = action_names[action_taken] if action_taken < len(action_names) else f"ACT_{action_taken}"
+                draw.text((5, 35), f"Action: {action_name}", fill=(0, 255, 0), font=font)
+            
+            if reward is not None:
+                draw.text((5, 50), f"Reward: {reward:.3f}", fill=(255, 0, 255), font=font)
+            
+            # Add game state information
+            total_levels = self._get_total_pokemon_levels()
+            unique_screens = self.screen_record.get_exploration_progress()['unique_screens']
+            draw.text((5, 65), f"Levels: {total_levels}", fill=(0, 255, 255), font=font)
+            draw.text((5, 80), f"Unique Screens: {unique_screens}", fill=(0, 255, 255), font=font)
+            
+            # Save the debug image
+            debug_filename = f"cnn_input_{step_count:06d}.png"
+            debug_path = self.cnn_debug_dir / debug_filename
+            pil_image.save(debug_path)
+            
+            # Also save the raw observation data for analysis
+            raw_filename = f"cnn_data_{step_count:06d}.npy"
+            raw_path = self.cnn_debug_dir / raw_filename
+            np.save(raw_path, observation)
+            
+        except Exception as e:
+            print(f"Warning: Failed to save CNN debug visualization: {e}")
+    
+    def _create_cnn_debug_video(self, max_frames=1000):
+        """
+        Create a video from saved CNN debug frames to see the model's perception over time.
+        
+        Args:
+            max_frames: Maximum number of frames to include in video
+        """
+        try:
+            import cv2
+            
+            # Find all CNN debug images
+            debug_images = sorted(list(self.cnn_debug_dir.glob("cnn_input_*.png")))
+            
+            if not debug_images:
+                print("No CNN debug images found to create video")
+                return
+                
+            # Limit to max_frames
+            if len(debug_images) > max_frames:
+                debug_images = debug_images[-max_frames:]  # Take most recent frames
+            
+            # Read first image to get dimensions
+            first_img = cv2.imread(str(debug_images[0]))
+            height, width, layers = first_img.shape
+            
+            # Create video writer
+            video_path = self.cnn_debug_dir / "cnn_perception_video.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(str(video_path), fourcc, 10.0, (width, height))
+            
+            print(f"Creating CNN perception video from {len(debug_images)} frames...")
+            
+            for img_path in debug_images:
+                img = cv2.imread(str(img_path))
+                video_writer.write(img)
+            
+            video_writer.release()
+            print(f"CNN perception video saved to: {video_path}")
+            
+        except ImportError:
+            print("OpenCV not available - install with: pip install opencv-python")
+        except Exception as e:
+            print(f"Failed to create CNN debug video: {e}")
     
     def _read_uint16(self, address):
         """Read 16-bit unsigned integer (little-endian)."""
@@ -908,9 +1117,11 @@ def make_env(rank, config):
         Function that creates a new environment
     """
     def _init():
-        # Add rank-specific save path
+        # Use shared session folder with env-specific subfolders for screenshots only
         env_config = config.copy()
-        env_config['save_path'] = f"{config['save_path']}/env_{rank}"
+        # Don't create separate env folders - use the main session folder
+        # Each env will create its own screenshot subfolder if needed
+        env_config['env_rank'] = rank  # Pass rank for screenshot organization
         
         # Create environment
         env = PokemonRedEnv(env_config)
@@ -1140,10 +1351,9 @@ if not os.path.exists(ROM_PATH):
     print("The ROM should be exactly 1MB (1,048,576 bytes)")
     exit(1)
 
-# Create session directory with timestamp
+# Create session directory with timestamp - this will contain all env folders
 SESSION_NAME = f"pokemon_rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 SESSION_PATH = Path('./sessions') / SESSION_NAME
-SESSION_PATH.mkdir(parents=True, exist_ok=True)
 
 print(f"\nSession Directory: {SESSION_PATH}")
 
@@ -1153,22 +1363,24 @@ ENV_CONFIG = {
     'headless': True,  # No visualization during training (faster)
     'action_freq': 24,  # Execute 24 frames per action
     'max_steps': 8192,  # Maximum steps per episode
-    'save_path': str(SESSION_PATH),
-    'save_screenshots': True
+    'save_path': str(SESSION_PATH),  # Each env will create subfolders under this
+    'save_screenshots': True,
+    'debug_cnn_input': True,  # 🔬 Enable CNN input debugging visualization
+    'cnn_save_frequency': 100,  # Save CNN debug frames every 50 steps
 }
 
 def main():
     """Main training function."""
     # Training hyperparameters - BALANCED LEARNING SETTINGS
-    NUM_ENVS = min(8, os.cpu_count())  # Parallel environments
-    TOTAL_TIMESTEPS = 100_000  # Learn game progression
+    NUM_ENVS = min(6, os.cpu_count())  # Parallel environments
+    TOTAL_TIMESTEPS = 1_000_000  # Learn game progression
     SAVE_FREQ = 5_000  # Save checkpoint every 5k steps
-    LEARNING_RATE = 0.001
-    N_STEPS = 256  # ⬆️ INCREASED from 64 - More stable updates every 256*4=1024 steps
-    BATCH_SIZE = 256  # Match N_STEPS for efficient learning
-    N_EPOCHS = 4  # ⬇️ REDUCED from 8 - Prevent overfitting to random exploration
-    GAMMA = 0.99  # ⬆️ INCREASED from 0.9 - Long-term strategy important for Pokemon
-    GAE_LAMBDA = 0.95  # ⬆️ INCREASED from 0.85 - Better advantage estimation
+    LEARNING_RATE = 0.0001
+    N_STEPS = 512  # ⬆️ INCREASED from 64 - More stable updates every 256*4=1024 steps
+    BATCH_SIZE = 512  # Match N_STEPS for efficient learning
+    N_EPOCHS = 8  # ⬇️ REDUCED from 8 - Prevent overfitting to random exploration
+    GAMMA = 0.9995  # ⬆️ INCREASED from 0.9 - Long-term strategy important for Pokemon
+    GAE_LAMBDA = 0.995  # ⬆️ INCREASED from 0.85 - Better advantage estimation
 
     print(f"\nTraining Configuration:")
     print(f"  Parallel Environments: {NUM_ENVS}")
@@ -1199,26 +1411,26 @@ def main():
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
-        gamma=GAMMA,
-        gae_lambda=GAE_LAMBDA,
-        clip_range=0.2,  # ⬇️ REDUCED from 0.4 - more conservative policy updates
-        clip_range_vf=None,
-        ent_coef=0.25,  # ⬆️ INCREASED from 0.15 - start higher to prevent collapse
+        gamma=GAMMA, 
+        gae_lambda=GAE_LAMBDA, 
+        clip_range=0.02,  # ⬇️ REDUCED from 0.4 - more conservative policy updates
+        clip_range_vf=None, # No value function clipping
+        ent_coef=0.35,  # ⬆️ INCREASED from 0.15 - start higher to prevent collapse
         # This allows early exploration but doesn't overwhelm game rewards
         # 0.25 is moderate-high - enough exploration without entropy addiction
         # Will be reduced over time via callback to allow strategy development
         vf_coef=0.5,  # ⬆️ INCREASED from 0.3 - value function helps learn game strategy
-        max_grad_norm=0.5,
-        use_sde=False,
-        sde_sample_freq=-1,
+        max_grad_norm=0.5, # ⬇️ REDUCED from 0.8 - more stable training
+        use_sde=False, # 🔧 FIXED: Disable SDE for discrete actions (Pokemon uses discrete action space)
+        sde_sample_freq=-1, # No SDE
         target_kl=None,  # Remove KL limit - allow reasonable policy changes
         tensorboard_log=str(SESSION_PATH / 'tensorboard'),
         policy_kwargs=dict(
             features_extractor_kwargs=dict(features_dim=512)
         ),
         verbose=1,
-        seed=None,
-        device='auto'
+        seed=42,  # for reproducibility, set a specific seed here
+        device='auto' # use GPU if available (CUDA)
     )
 
     print(f"Model initialized. Device: {model.device}")
@@ -1571,8 +1783,14 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"❌ Error: {e}")
     
-    # Launch menu
-    show_menu()
+    # Launch menu by default, but allow direct training
+    if len(sys.argv) > 1 and sys.argv[1] == '--train':
+        # Direct training mode
+        print("🏋️  Starting direct training mode...")
+        main()
+    else:
+        # Interactive menu mode
+        show_menu()
 
 # ============================================================================
 # HELPER FUNCTIONS FOR TRAINING AND EVALUATION

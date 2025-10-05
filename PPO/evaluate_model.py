@@ -22,6 +22,7 @@ from PIL import Image
 
 # Import training components
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from pyboy import PyBoy
 import gymnasium as gym
 from gymnasium import spaces
@@ -60,10 +61,19 @@ class PokemonRedEvalEnv(gym.Env):
         # Get screen interface (PyBoy 2.0 API)
         self.screen = self.pyboy.screen
         
-        # Action and observation spaces
+        # Action and observation spaces (must match training)
         self.action_space = spaces.Discrete(9)
+        
+        # CNN architecture parameters (matching training script)
+        self.reduced_height = 36  # 144 / 4
+        self.reduced_width = 40   # 160 / 4
+        self.num_stacked_screens = 3
+        
         self.observation_space = spaces.Box(
-            low=0, high=255, shape=(120, 128, 3), dtype=np.uint8
+            low=0,
+            high=255,
+            shape=(self.reduced_height, self.reduced_width, self.num_stacked_screens),
+            dtype=np.uint8
         )
         
         # Action mapping (PyBoy 2.0 uses string button names)
@@ -77,6 +87,10 @@ class PokemonRedEvalEnv(gym.Env):
         self.episode_reward = 0
         self.milestones = []
         self.visited_coordinates = set()
+        
+        # Screen history for stacking (matching training script)
+        from collections import deque
+        self.screen_history = deque(maxlen=self.num_stacked_screens)
         
         # Memory addresses (same as training)
         self.PLAYER_X = 0xD362
@@ -103,6 +117,9 @@ class PokemonRedEvalEnv(gym.Env):
         self.episode_reward = 0
         self.visited_coordinates = set()
         self.milestones = []
+        
+        # Reset screen history
+        self.screen_history.clear()
         
         return self._get_observation(), {}
     
@@ -155,20 +172,78 @@ class PokemonRedEvalEnv(gym.Env):
             self.pyboy.tick()
     
     def _get_observation(self):
-        """Get screen observation."""
-        # PyBoy 2.0 API: Convert PIL Image to RGB numpy array
+        """
+        Get observation following proven architecture:
+        - 3 most recent screens stacked for short-term memory
+        - Resolution reduced 4x for speed/memory efficiency  
+        - Grayscale conversion
+        - Visual status bars overlaid for game state
+        """
+        # Get raw screen from PyBoy
         screen_image = self.pyboy.screen.image.convert('RGB')
-        screen = np.asarray(screen_image)
+        screen_array = np.asarray(screen_image)
         
-        # Downsample
-        from skimage.transform import resize
-        downsampled = resize(
-            screen, (120, 128),
-            anti_aliasing=True,
-            preserve_range=True
-        ).astype(np.uint8)
+        # Convert to grayscale and reduce resolution 4x
+        screen_gray = np.mean(screen_array, axis=2).astype(np.uint8)  # RGB to grayscale
+        screen_reduced = screen_gray[::4, ::4]  # Reduce from 144x160 to 36x40
         
-        return downsampled
+        # Add status bars (simple visual indicators for game state)
+        screen_with_status = self._add_status_bars(screen_reduced)
+        
+        # Add to screen history for stacking
+        self.screen_history.append(screen_with_status)
+        
+        # Stack the 3 most recent screens (padding with first screen if needed)
+        if len(self.screen_history) < self.num_stacked_screens:
+            # Pad with first screen until we have enough history
+            stacked_screens = np.stack([self.screen_history[0]] * self.num_stacked_screens, axis=-1)
+        else:
+            stacked_screens = np.stack(list(self.screen_history), axis=-1)
+        
+        return stacked_screens
+    
+    def _add_status_bars(self, screen):
+        """
+        Add visual status bars as described in the proven methodology.
+        Overlays simple bars showing HP, levels, and exploration progress.
+        """
+        # Create copy to modify
+        screen_with_status = screen.copy()
+        
+        # Get game state for status bars
+        total_levels = self._get_total_pokemon_levels()
+        unique_screens = len(self.visited_coordinates)  # Simple exploration progress
+        
+        # Add simple status bars in top-right area (visible but not intrusive)
+        # HP bar (assume 100 max for visualization)
+        hp_percentage = min(100, total_levels * 10) / 100  # Rough HP indicator from levels
+        hp_bar_length = int(hp_percentage * 8)  # 8 pixel max bar
+        
+        # Draw HP bar (top-right corner)
+        if hp_bar_length > 0:
+            screen_with_status[1:3, -10:-10+hp_bar_length] = 255  # White bar
+        
+        # Exploration bar (based on unique positions visited)
+        explore_percentage = min(unique_screens / 100, 1.0)  # Up to 100 unique positions = full bar
+        explore_bar_length = int(explore_percentage * 8)
+        
+        # Draw exploration bar (below HP bar)
+        if explore_bar_length > 0:
+            screen_with_status[4:6, -10:-10+explore_bar_length] = 200  # Light gray bar
+        
+        return screen_with_status
+    
+    def _get_total_pokemon_levels(self):
+        """Get total levels of all Pokemon in party."""
+        total_levels = 0
+        party_size = self.pyboy.memory[self.PARTY_SIZE]
+        
+        # Simplified level reading for evaluation
+        if party_size > 0:
+            # Assume average level for display purposes
+            total_levels = party_size * 10  # Rough estimate
+        
+        return total_levels
     
     def _get_position(self):
         """Get current player position."""
@@ -253,7 +328,11 @@ def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
     print("=" * 80)
     
     # Create environment with rendering
-    env = PokemonRedEvalEnv(rom_path, headless=False)
+    base_env = PokemonRedEvalEnv(rom_path, headless=False)
+    
+    # Wrap environment to match training setup
+    env = DummyVecEnv([lambda: base_env])
+    env = VecTransposeImage(env)  # This converts (H, W, C) to (C, H, W) for CNN
     
     # Load model
     print("\nLoading model...")
@@ -261,7 +340,7 @@ def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
     print("✓ Model loaded successfully")
     
     # Reset environment
-    obs, info = env.reset()
+    obs = env.reset()
     
     # Run demo
     print("\nStarting demo...")
@@ -281,20 +360,24 @@ def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
                 # Get action from model (with probabilities for debugging)
                 action, _states = model.predict(obs, deterministic=(not stochastic))
                 
-                # Convert action to int if it's an array
-                action_int = int(action) if hasattr(action, '__iter__') else action
+                # Convert action to int if it's an array (fix deprecation warning)
+                if hasattr(action, '__iter__') and len(action) > 0:
+                    action_int = int(action[0])
+                else:
+                    action_int = int(action)
                 action_counts[action_int] += 1
                 
                 # Execute action
-                obs, reward, done, truncated, info = env.step(action_int)
-                total_reward += reward
+                obs, reward, done, info = env.step([action_int])  # VecEnv expects list of actions
+                total_reward += reward[0]  # VecEnv returns arrays
                 
                 step += 1
                 
                 # Print progress every 100 steps with action distribution
                 if step % 100 == 0:
-                    badges = info.get('badges', 0)
-                    coords = info.get('coordinates_explored', 0)
+                    info_dict = info[0] if info else {}  # VecEnv returns list of info dicts
+                    badges = info_dict.get('badges', 0)
+                    coords = info_dict.get('coordinates_explored', 0)
                     print(f"Step {step}/{num_steps} | "
                           f"Reward: {total_reward:.1f} | "
                           f"Badges: {badges} | "
@@ -310,13 +393,14 @@ def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
                         print()
                 
                 # Auto-screenshot on badge acquisition
-                badges = info.get('badges', 0)
+                info_dict = info[0] if info else {}
+                badges = info_dict.get('badges', 0)
                 if badges > 0 and step % 500 == 0:
-                    env.capture_screenshot(f"badge_{badges}")
+                    base_env.capture_screenshot(f"badge_{badges}")
                 
-                if done:
+                if done[0]:  # VecEnv returns array of done flags
                     print("\n✓ Episode completed!")
-                    obs, info = env.reset()
+                    obs = env.reset()
             
             # Small delay for visibility
             time.sleep(0.01)
@@ -325,8 +409,8 @@ def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
         print("\n\nDemo interrupted by user")
     
     finally:
-        # Final screenshot
-        env.capture_screenshot('final')
+        # Final screenshot through base environment
+        base_env.capture_screenshot('final')
         
         # Print final stats
         print("\n" + "=" * 80)
@@ -346,18 +430,23 @@ def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
         
         # Print info if available
         if info:
-            badges = info.get('badges', 0)
-            coords = info.get('coordinates_explored', 0)
+            info_dict = info[0] if info else {}
+            badges = info_dict.get('badges', 0)
+            coords = info_dict.get('coordinates_explored', 0)
             print(f"\nBadges Obtained: {badges}")
             print(f"Coordinates Explored: {coords}")
         
-        print(f"Screenshots saved to: {env.screenshot_dir}")
+        print(f"Screenshots saved to: {base_env.screenshot_dir}")
         
         # Safe cleanup
         try:
             env.close()
         except Exception as e:
             print(f"Note: Environment cleanup warning (can be ignored): {e}")
+        try:
+            base_env.pyboy.stop()
+        except Exception as e:
+            print(f"Note: PyBoy cleanup warning (can be ignored): {e}")
 
 # ============================================================================
 # EVALUATION MODE - Statistical evaluation across multiple episodes
@@ -380,7 +469,11 @@ def run_evaluation(model_path, rom_path, num_episodes=10):
     print("=" * 80)
     
     # Create headless environment for speed
-    env = PokemonRedEvalEnv(rom_path, headless=True, save_screenshots=False)
+    base_env = PokemonRedEvalEnv(rom_path, headless=True, save_screenshots=False)
+    
+    # Wrap environment to match training setup
+    env = DummyVecEnv([lambda: base_env])
+    env = VecTransposeImage(env)
     
     # Load model
     print("\nLoading model...")
@@ -397,7 +490,7 @@ def run_evaluation(model_path, rom_path, num_episodes=10):
     print(f"\nRunning {num_episodes} evaluation episodes...\n")
     
     for episode in range(num_episodes):
-        obs, info = env.reset()
+        obs = env.reset()
         episode_reward = 0
         episode_length = 0
         done = False
@@ -406,16 +499,18 @@ def run_evaluation(model_path, rom_path, num_episodes=10):
         
         while not done and episode_length < 10000:
             action, _states = model.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = env.step(action)
+            obs, reward, done_array, info = env.step([action])
             
-            episode_reward += reward
+            episode_reward += reward[0]  # VecEnv returns arrays
             episode_length += 1
+            done = done_array[0]  # Get done flag from array
         
         # Store statistics
+        info_dict = info[0] if info else {}
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
-        episode_badges.append(info['badges'])
-        episode_explorations.append(info['coordinates_explored'])
+        episode_badges.append(info_dict.get('badges', 0))
+        episode_explorations.append(info_dict.get('coordinates_explored', 0))
         
         print(f"Reward: {episode_reward:.1f}, "
               f"Length: {episode_length}, "
