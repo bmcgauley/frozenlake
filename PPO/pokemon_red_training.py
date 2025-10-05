@@ -1160,7 +1160,7 @@ ENV_CONFIG = {
 def main():
     """Main training function."""
     # Training hyperparameters - BALANCED LEARNING SETTINGS
-    NUM_ENVS = min(4, os.cpu_count())  # Parallel environments
+    NUM_ENVS = min(8, os.cpu_count())  # Parallel environments
     TOTAL_TIMESTEPS = 100_000  # Learn game progression
     SAVE_FREQ = 5_000  # Save checkpoint every 5k steps
     LEARNING_RATE = 0.001
