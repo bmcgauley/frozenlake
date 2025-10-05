@@ -157,6 +157,9 @@ PARTY_POKEMON_6_LEVEL = 0xD24A        # 6th Pokemon level
 # Badge flags (for additional progress tracking)
 BADGE_FLAGS_ADDRESS = 0xD356
 
+# Battle state tracking
+BATTLE_TYPE_ADDRESS = 0xD057          # 0 = not in battle, >0 = in battle
+
 # ============================================================================
 # SIMPLIFIED MILESTONES - Focus on major progression points
 # ============================================================================
