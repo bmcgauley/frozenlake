@@ -230,7 +230,7 @@ class PokemonRedEvalEnv(gym.Env):
 # DEMO MODE - Visual demonstration with human interaction
 # ============================================================================
 
-def run_demo(model_path, rom_path, num_steps=10000):
+def run_demo(model_path, rom_path, num_steps=10000, stochastic=False):
     """
     Run visual demonstration of trained model.
     
@@ -238,12 +238,14 @@ def run_demo(model_path, rom_path, num_steps=10000):
         model_path: Path to trained model .zip file
         rom_path: Path to Pokemon Red ROM
         num_steps: Number of steps to run
+        stochastic: If True, sample actions from policy distribution instead of using max
     """
     print("\n" + "=" * 80)
     print("DEMO MODE - Visual Evaluation")
     print("=" * 80)
     print(f"Model: {model_path}")
     print(f"Steps: {num_steps}")
+    print(f"Mode: {'Stochastic (sampling)' if stochastic else 'Deterministic (greedy)'}")
     print("\nControls:")
     print("  ESC - Exit demo")
     print("  SPACE - Take screenshot")
@@ -267,26 +269,50 @@ def run_demo(model_path, rom_path, num_steps=10000):
     step = 0
     
     try:
+        # Track action distribution for debugging
+        action_counts = {i: 0 for i in range(9)}
+        action_names = ['down', 'left', 'right', 'up', 'a', 'b', 'start', 'select', 'wait']
+        
+        # Track cumulative reward
+        total_reward = 0.0
+        
         while step < num_steps:
             if not paused:
-                # Get action from model
-                action, _states = model.predict(obs, deterministic=True)
+                # Get action from model (with probabilities for debugging)
+                action, _states = model.predict(obs, deterministic=(not stochastic))
+                
+                # Convert action to int if it's an array
+                action_int = int(action) if hasattr(action, '__iter__') else action
+                action_counts[action_int] += 1
                 
                 # Execute action
-                obs, reward, done, truncated, info = env.step(action)
+                obs, reward, done, truncated, info = env.step(action_int)
+                total_reward += reward
                 
                 step += 1
                 
-                # Print progress every 100 steps
+                # Print progress every 100 steps with action distribution
                 if step % 100 == 0:
+                    badges = info.get('badges', 0)
+                    coords = info.get('coordinates_explored', 0)
                     print(f"Step {step}/{num_steps} | "
-                          f"Reward: {info['reward']:.1f} | "
-                          f"Badges: {info['badges']} | "
-                          f"Explored: {info['coordinates_explored']}")
+                          f"Reward: {total_reward:.1f} | "
+                          f"Badges: {badges} | "
+                          f"Explored: {coords}")
+                    # Show action distribution
+                    total_actions = sum(action_counts.values())
+                    if total_actions > 0:
+                        print(f"  Action distribution: ", end="")
+                        for i, name in enumerate(action_names):
+                            pct = 100.0 * action_counts[i] / total_actions
+                            if pct > 5.0:  # Only show actions used >5% of time
+                                print(f"{name}:{pct:.1f}% ", end="")
+                        print()
                 
                 # Auto-screenshot on badge acquisition
-                if info['badges'] > 0 and step % 500 == 0:
-                    env.capture_screenshot(f"badge_{info['badges']}")
+                badges = info.get('badges', 0)
+                if badges > 0 and step % 500 == 0:
+                    env.capture_screenshot(f"badge_{badges}")
                 
                 if done:
                     print("\n✓ Episode completed!")
@@ -307,12 +333,31 @@ def run_demo(model_path, rom_path, num_steps=10000):
         print("DEMO COMPLETED")
         print("=" * 80)
         print(f"Total Steps: {step}")
-        print(f"Final Reward: {info['reward']:.2f}")
-        print(f"Badges Obtained: {info['badges']}")
-        print(f"Coordinates Explored: {info['coordinates_explored']}")
+        print(f"Final Reward: {total_reward:.2f}")
+        
+        # Print action distribution summary
+        print("\nAction Distribution Summary:")
+        total_actions = sum(action_counts.values())
+        if total_actions > 0:
+            for i, name in enumerate(action_names):
+                count = action_counts[i]
+                pct = 100.0 * count / total_actions
+                print(f"  {name.upper():8s}: {count:6d} ({pct:5.1f}%)")
+        
+        # Print info if available
+        if info:
+            badges = info.get('badges', 0)
+            coords = info.get('coordinates_explored', 0)
+            print(f"\nBadges Obtained: {badges}")
+            print(f"Coordinates Explored: {coords}")
+        
         print(f"Screenshots saved to: {env.screenshot_dir}")
         
-        env.close()
+        # Safe cleanup
+        try:
+            env.close()
+        except Exception as e:
+            print(f"Note: Environment cleanup warning (can be ignored): {e}")
 
 # ============================================================================
 # EVALUATION MODE - Statistical evaluation across multiple episodes
@@ -444,6 +489,8 @@ if __name__ == '__main__':
                        help='Number of episodes for eval mode')
     parser.add_argument('--steps', type=int, default=10000,
                        help='Number of steps for demo mode')
+    parser.add_argument('--stochastic', action='store_true',
+                       help='Use stochastic action selection (sample from policy) instead of deterministic (greedy)')
     
     args = parser.parse_args()
     
@@ -459,7 +506,7 @@ if __name__ == '__main__':
     
     # Run appropriate mode
     if args.mode == 'demo':
-        run_demo(args.model, args.rom, args.steps)
+        run_demo(args.model, args.rom, args.steps, args.stochastic)
     else:
         run_evaluation(args.model, args.rom, args.episodes)
     

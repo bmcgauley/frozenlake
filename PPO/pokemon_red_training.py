@@ -1,12 +1,19 @@
 """
-Pokemon Red Reinforcement Learning Speedrunning Agent
-Main Training Implementation with Comprehensive Reward Shaping
+Universal Game Boy Game Learner
+PPO-based agent that learns to play ANY Game Boy game through visual exploration
 
-This implementation creates a PPO-based agent that learns to speedrun Pokemon Red
-through the Elite Four, with detailed reward engineering and swarm-based weight sharing.
+This implementation creates a generalized game-playing agent that works across
+different Game Boy titles by focusing on visual novelty and exploration rather
+than game-specific mechanics.
+
+PHILOSOPHY:
+- Reward visual novelty (seeing new screens) 
+- Minimal time penalty to encourage action
+- No game-specific knowledge or rewards
+- Universal approach that works for Pokemon, Mario, Zelda, etc.
 
 Requirements:
-- Pokemon Red ROM file named 'PokemonRed.gb' in same directory
+- Game Boy ROM file (any .gb file)
 - PyBoy emulator for Game Boy emulation
 - Stable-baselines3 for PPO algorithm
 - PyTorch as backend
@@ -14,10 +21,9 @@ Requirements:
 
 Architecture:
 - Custom Gymnasium environment wrapping PyBoy emulator
-- Multi-component reward system with progress tracking
-- Coordinate-based exploration (memory efficient)
+- Screen-based novelty detection for exploration rewards
+- Minimal reward structure for universal game learning
 - Parallel environment training for speed
-- Automatic milestone screenshot capture
 - Real-time training metrics and visualization
 """
 
@@ -46,8 +52,11 @@ from stable_baselines3.common.monitor import Monitor
 # Import preprocessing utilities
 from skimage.transform import resize
 
+# Import custom screen state tracker
+from screen_state_tracker import ScreenStateTracker
+
 print("=" * 80)
-print("POKEMON RED RL SPEEDRUNNING AGENT - TRAINING SYSTEM")
+print("UNIVERSAL GAME BOY GAME LEARNER - TRAINING SYSTEM")
 print("=" * 80)
 print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print(f"PyTorch Version: {torch.__version__}")
@@ -193,6 +202,12 @@ class PokemonRedEnv(gym.Env):
         # Initialize milestone tracking (must be before reset())
         self.milestones_achieved = set()
         
+        # Initialize screen state tracker for advanced stagnation detection
+        self.screen_tracker = ScreenStateTracker(
+            history_size=100,  # Remember last 100 screens
+            short_term_size=20  # Check for loops in last 20 screens
+        )
+        
         # Create save directories
         self.screenshots_dir = Path(self.save_path) / 'screenshots'
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
@@ -221,63 +236,17 @@ class PokemonRedEnv(gym.Env):
         # Initialize step counter
         self.current_step = 0
         
-        # Initialize position tracking for exploration
-        self.visited_coordinates = set()
-        self.visited_maps = set()  # Track unique maps visited
-        self.last_position = None
-        self.position_stuck_counter = 0
+        # Reset screen state tracker (but keep long-term memory for novelty detection)
+        self.screen_tracker.reset()
         
-        # Screen hash tracking for TRUE stagnation detection
-        self.screen_hash_history = deque(maxlen=20)  # Last 20 screen hashes
-        self.last_screen_hash = None
-        self.same_screen_counter = 0
-        
-        # Action diversity tracking
+        # Action tracking for info only
         self.action_history = deque(maxlen=10)  # Last 10 actions taken
         self.last_action = None
         
-        # Initialize menu tracking
-        self.menu_time_counter = 0
-        self.last_menu_state = 0
-        
-        # Initialize battle tracking
-        self.last_battle_type = 0
-        self.battles_won = 0
-        self.battles_lost = 0
-        self.damage_dealt_total = 0
-        self.last_enemy_hp = 0
-        
-        # Initialize Pokemon tracking
-        self.pokemon_seen_count = 0
-        self.pokemon_caught_count = 0
-        self.last_seen_count = 0
-        self.last_caught_count = 0
-        
-        # Initialize badge tracking
-        self.badges_obtained = 0
-        self.last_badge_count = 0
-        
-        # Initialize level tracking
-        self.party_level_sum = 0
-        self.max_opponent_level = 0
-        
-        # Initialize death tracking
-        self.deaths = 0
-        
-        # Initialize event tracking
-        self.events_completed = 0
-        
-        # Initialize reward tracking for visualization
+        # Initialize simple reward tracking
         self.episode_rewards = {
-            'exploration': 0,
-            'battle_won': 0,
-            'battle_engaged': 0,
-            'damage_dealt': 0,
-            'pokemon_caught': 0,
-            'gym_badge': 0,
-            'death_penalty': 0,
-            'stuck_penalty': 0,
-            'menu_penalty': 0,
+            'exploration': 0,     # Screen novelty and action bonuses
+            'time_penalty': 0,    # Step cost
             'total': 0
         }
         
@@ -418,252 +387,66 @@ class PokemonRedEnv(gym.Env):
     
     def _calculate_reward(self):
         """
-        Calculate comprehensive reward based on multiple components.
+        UNIVERSAL GAME BOY GAME LEARNER REWARD STRUCTURE
         
-        EXPLORATION-FOCUSED REWARD STRUCTURE (based on P2 findings):
-        - Much higher rewards for discovery and progress
-        - Lower penalties to encourage experimentation
+        Philosophy: Reward visual novelty and exploration, nothing game-specific.
+        This approach works for ANY Game Boy game - Pokemon, Mario, Zelda, etc.
         
-        Reward Components:
-        1. Exploration: New coordinates visited (+20.0 per new location) ⬆️
-        2. Map Discovery: New map areas (+100.0) ⬆️
-        3. Battle Engagement: Starting battles (+5.0) ⬆️
-        4. Damage Dealt: Damaging enemy Pokemon (+2.0 per HP) ⬆️
-        5. Battle Victory: Winning battles (+200.0) ⬆️
-        6. Pokemon Catching: Catching new Pokemon (+400.0) ⬆️
-        7. Gym Badges: Obtaining badges (+500.0) ⬆️
-        8. Death Penalty: Pokemon fainting (-5.0)
-        9. Stuck Penalty: Staying in same position (-0.2 per step) ⬇️
-        10. Menu Penalty: Staying in menus too long (-0.01 per step) ⬇️
-        11. Time Penalty: Per-step cost (-0.01) ⬇️
+        Reward Components (SIMPLIFIED):
+        1. Screen Novelty: Seeing new visual states (+1.0)
+        2. Time Penalty: Small cost per step (-0.01) 
+        3. Movement Bonus: Tiny reward for any action (prevents getting stuck)
+        
+        NO GAME-SPECIFIC REWARDS:
+        - No Pokemon catching, battles, badges, etc.
+        - No memory address reading for game state
+        - No complex penalties or diversity requirements
+        
+        The agent learns to explore and discover game mechanics naturally!
         """
         total_reward = 0.0
         
-        # Apply small time penalty to encourage action
-        time_penalty = -0.01
+        # ====================================================================
+        # 1. TIME PENALTY - Encourage taking actions
+        # ====================================================================
+        time_penalty = -0.01  # Small cost per step to encourage progress
         total_reward += time_penalty
+        self.episode_rewards['time_penalty'] = self.episode_rewards.get('time_penalty', 0) + time_penalty
         
         # ====================================================================
-        # 0. SCREEN STAGNATION DETECTION - Critical for title screen!
+        # 2. SCREEN NOVELTY REWARD - Universal exploration incentive
         # ====================================================================
-        current_screen_hash = self._get_screen_hash()
+        # Get current screen for novelty detection
+        screen_image = self.pyboy.screen.image.convert('RGB')
+        screen_array = np.asarray(screen_image)
         
-        # Check if screen has changed at all
-        if current_screen_hash == self.last_screen_hash:
-            self.same_screen_counter += 1
-            # HARSH penalty for being on same screen
-            if self.same_screen_counter > 5:  # Just 5 steps of same screen
-                stagnation_penalty = -1.0  # HUGE penalty!
-                total_reward += stagnation_penalty
-                self.episode_rewards['stuck_penalty'] += stagnation_penalty
-        else:
-            # Screen changed! Small reward
-            screen_change_reward = 0.2
-            total_reward += screen_change_reward
-            self.episode_rewards['exploration'] += screen_change_reward
-            self.same_screen_counter = 0
+        # Update screen tracker and get novelty reward
+        screen_analysis = self.screen_tracker.update(screen_array)
         
-        self.screen_hash_history.append(current_screen_hash)
-        self.last_screen_hash = current_screen_hash
+        # Reward for seeing new screens (universal across all games)
+        if screen_analysis.get('is_new_screen', False):
+            novelty_reward = 1.0  # Simple, consistent reward for visual novelty
+            total_reward += novelty_reward
+            self.episode_rewards['exploration'] = self.episode_rewards.get('exploration', 0) + novelty_reward
+        
+        # Small bonus for screen diversity (prevents getting stuck in loops)
+        diversity_bonus = screen_analysis.get('diversity_score', 0) * 0.1
+        total_reward += diversity_bonus
+        self.episode_rewards['exploration'] = self.episode_rewards.get('exploration', 0) + diversity_bonus
         
         # ====================================================================
-        # 0.5. ACTION DIVERSITY REWARD - Encourage trying different buttons
+        # 3. ACTION BONUS - Tiny reward for taking any action
         # ====================================================================
-        if len(self.action_history) >= 3:
-            # Count unique actions in recent history
-            unique_actions = len(set(self.action_history))
-            # Reward diversity
-            if unique_actions >= 3:  # Using at least 3 different buttons
-                diversity_bonus = 0.1
-                total_reward += diversity_bonus
-                self.episode_rewards['exploration'] += diversity_bonus
-            elif unique_actions == 1:  # Spamming same button
-                diversity_penalty = -0.2
-                total_reward += diversity_penalty
-                self.episode_rewards['stuck_penalty'] += diversity_penalty
-        
-        # ====================================================================
-        # 1. EXPLORATION REWARD - New coordinates visited
-        # ====================================================================
-        current_x = self._read_memory(PLAYER_X_ADDRESS)
-        current_y = self._read_memory(PLAYER_Y_ADDRESS)
-        current_map = self._read_memory(MAP_ID_ADDRESS)
-        current_pos = (current_map, current_x, current_y)
-        
-        # SEVERE penalty if stuck on title screen (map 0, pos 0,0)
-        if current_map == 0 and current_x == 0 and current_y == 0:
-            title_screen_penalty = -0.1  # Continuous penalty every step on title screen
-            total_reward += title_screen_penalty
-            self.episode_rewards['menu_penalty'] += title_screen_penalty
-        
-        # Check if this is a new position
-        if current_pos not in self.visited_coordinates:
-            self.visited_coordinates.add(current_pos)
-            exploration_reward = 0.5  # ⬇️ Reduced - save bigger rewards for actual progress
-            total_reward += exploration_reward
-            self.episode_rewards['exploration'] += exploration_reward
-        
-        # IMPORTANT: Reward ANY movement to encourage constant action
-        if self.last_position is not None and self.last_position != current_pos:
-            movement_reward = 0.5  # ⬆️ Reward for moving at all!
-            total_reward += movement_reward
-            self.episode_rewards['exploration'] += movement_reward
-        
-        # Track new maps discovered
-        if current_map not in self.visited_maps:
-            self.visited_maps.add(current_map)
-            map_discovery_reward = 100.0  # ⬆️ Huge reward for discovering new areas
-            total_reward += map_discovery_reward
-            self.episode_rewards['exploration'] += map_discovery_reward
-            print(f"🗺️  NEW MAP DISCOVERED! ID: {current_map}")
-        
-        # Check if player is stuck in same position
-        if self.last_position == current_pos:
-            self.position_stuck_counter += 1
-            # Apply penalty immediately for being stuck
-            if self.position_stuck_counter > 3:  # ⬇️ Reduced threshold from 10 to 3
-                stuck_penalty = -0.5  # ⬆️ Increased penalty from -0.2 to discourage standing still
-                total_reward += stuck_penalty
-                self.episode_rewards['stuck_penalty'] += stuck_penalty
-        else:
-            self.position_stuck_counter = 0
-        
-        self.last_position = current_pos
-        
-        # ====================================================================
-        # 2. MENU PENALTY - Discourage staying in menus
-        # ====================================================================
-        current_menu = self._read_memory(MENU_STATE_ADDRESS)
-        
-        # If in a menu (non-zero menu state)
-        if current_menu != 0:
-            self.menu_time_counter += 1
-            # CONTINUOUS penalty for being in menu - gets worse over time
-            menu_penalty = -0.05 * (1 + self.menu_time_counter / 100.0)  # Escalating penalty
-            total_reward += menu_penalty
-            self.episode_rewards['menu_penalty'] += menu_penalty
-        else:
-            self.menu_time_counter = 0
-        
-        # ====================================================================
-        # 3. BATTLE ENGAGEMENT REWARD
-        # ====================================================================
-        current_battle = self._read_memory(IN_BATTLE_ADDRESS)
-        
-        # Check if entering a battle (transition from 0 to non-zero)
-        if current_battle != 0 and self.last_battle_type == 0:
-            battle_engage_reward = 5.0  # ⬆️ Increased from 0.5 to encourage battles
-            total_reward += battle_engage_reward
-            self.episode_rewards['battle_engaged'] += battle_engage_reward
-        
-        self.last_battle_type = current_battle
-        
-        # ====================================================================
-        # 4. DAMAGE DEALT REWARD
-        # ====================================================================
-        if current_battle != 0:
-            # Read enemy HP (this is approximate - actual tracking is complex)
-            enemy_hp = self._read_uint16(ENEMY_MON_LEVEL_ADDRESS + 10)
-            
-            # If enemy HP decreased, reward damage dealt
-            if self.last_enemy_hp > 0 and enemy_hp < self.last_enemy_hp:
-                damage = self.last_enemy_hp - enemy_hp
-                damage_reward = damage * 2.0  # ⬆️ Increased from 0.1 for stronger battle incentive
-                total_reward += damage_reward
-                self.episode_rewards['damage_dealt'] += damage_reward
-                self.damage_dealt_total += damage
-            
-            self.last_enemy_hp = enemy_hp
-        else:
-            self.last_enemy_hp = 0
-        
-        # ====================================================================
-        # 5. BATTLE VICTORY REWARD
-        # ====================================================================
-        # Battle ended (transition from non-zero to zero)
-        if current_battle == 0 and self.last_battle_type != 0:
-            # Check if player party still has HP (won) vs all fainted (lost)
-            party_alive = False
-            for i in range(6):
-                hp = self._read_uint16(PARTY_HP_START + i * 2)
-                if hp > 0:
-                    party_alive = True
-                    break
-            
-            if party_alive:
-                # Won the battle
-                battle_win_reward = 200.0  # ⬆️ Increased from 2.0 - HUGE victory reward!
-                total_reward += battle_win_reward
-                self.episode_rewards['battle_won'] += battle_win_reward
-                self.battles_won += 1
-            else:
-                # Lost the battle (death penalty applied below)
-                self.battles_lost += 1
-        
-        # ====================================================================
-        # 6. POKEMON CATCHING REWARD
-        # ====================================================================
-        # Count Pokemon owned via Pokedex bitfield
-        current_caught = self._count_bits(POKEDEX_OWNED_START, 19)
-        
-        if current_caught > self.last_caught_count:
-            new_catches = current_caught - self.last_caught_count
-            catch_reward = new_catches * 400.0  # ⬆️ Increased from 5.0 - MASSIVE catch reward!
-            total_reward += catch_reward
-            self.episode_rewards['pokemon_caught'] += catch_reward
-            self.pokemon_caught_count = current_caught
-            self.last_caught_count = current_caught
-        
-        # Track Pokemon seen (for exploration metric)
-        current_seen = self._count_bits(POKEDEX_SEEN_START, 19)
-        if current_seen > self.last_seen_count:
-            self.pokemon_seen_count = current_seen
-            self.last_seen_count = current_seen
-        
-        # ====================================================================
-        # 7. GYM BADGE REWARD
-        # ====================================================================
-        badge_flags = self._read_memory(BADGE_FLAGS_ADDRESS)
-        current_badges = bin(badge_flags).count('1')
-        
-        if current_badges > self.last_badge_count:
-            new_badges = current_badges - self.last_badge_count
-            badge_reward = new_badges * 500.0  # ⬆️ Increased from 20.0 - HUGE badge reward!
-            total_reward += badge_reward
-            self.episode_rewards['gym_badge'] += badge_reward
-            self.badges_obtained = current_badges
-            self.last_badge_count = current_badges
-        
-        # ====================================================================
-        # 8. DEATH PENALTY - All party Pokemon fainted
-        # ====================================================================
-        all_fainted = True
-        for i in range(6):
-            hp = self._read_uint16(PARTY_HP_START + i * 2)
-            if hp > 0:
-                all_fainted = False
-                break
-        
-        if all_fainted and self.party_level_sum > 0:  # Ensure party exists
-            death_penalty = -5.0
-            total_reward += death_penalty
-            self.episode_rewards['death_penalty'] += death_penalty
-            self.deaths += 1
-        
-        # ====================================================================
-        # Update party level sum for info tracking
-        # ====================================================================
-        party_size = self._read_memory(PARTY_SIZE_ADDRESS)
-        level_sum = 0
-        for i in range(min(party_size, 6)):
-            level = self._read_memory(PARTY_LEVEL_START + i)
-            level_sum += level
-        self.party_level_sum = level_sum
+        # Prevents agent from learning to do nothing
+        if self.last_action is not None and self.last_action != 8:  # 8 = no-op
+            action_bonus = 0.01  # Tiny bonus for any non-no-op action
+            total_reward += action_bonus
+            self.episode_rewards['exploration'] = self.episode_rewards.get('exploration', 0) + action_bonus
         
         # ====================================================================
         # Track total episode reward
         # ====================================================================
-        self.episode_rewards['total'] += total_reward
+        self.episode_rewards['total'] = self.episode_rewards.get('total', 0) + total_reward
         
         return total_reward
     
@@ -672,74 +455,40 @@ class PokemonRedEnv(gym.Env):
         Check if episode should terminate.
         
         Termination conditions:
-        1. Defeated Elite Four and Champion (WIN CONDITION)
-        2. Blacked out too many times (> 10 deaths)
+        1. Natural game termination (if detectable)
+        2. Episode length limit (handled by max_steps)
+        
+        For a universal game learner, we keep termination minimal.
         """
-        # Check for Elite Four completion (map ID or event flag)
-        # This is simplified - actual implementation needs specific event flags
-        
-        # Check death limit
-        if self.deaths > 10:
-            print("Episode terminated: Too many deaths")
-            return True
-        
+        # For now, let episodes run until max_steps
+        # Game-specific termination can be added later if needed
         return False
     
     def _get_info(self):
         """
         Return information dictionary for monitoring.
+        Simplified for universal game learning.
         """
         return {
             'step': self.current_step,
-            'position': self.last_position,
-            'coordinates_explored': len(self.visited_coordinates),
-            'badges': self.badges_obtained,
-            'party_level_sum': self.party_level_sum,
-            'pokemon_caught': self.pokemon_caught_count,
-            'pokemon_seen': self.pokemon_seen_count,
-            'battles_won': self.battles_won,
-            'battles_lost': self.battles_lost,
-            'deaths': self.deaths,
             'episode_reward': self.episode_rewards['total'],
-            'milestones': len(self.milestones_achieved),
-            'reward_breakdown': self.episode_rewards  # 🔥 ADD REWARD BREAKDOWN FOR TENSORBOARD!
+            'screens_seen': len(self.screen_tracker.seen_screens) if hasattr(self.screen_tracker, 'seen_screens') else 0,
+            'reward_breakdown': self.episode_rewards
         }
     
     def _check_milestones(self):
         """
         Check for milestone completion and capture screenshots.
+        Simplified for universal game learning - just capture periodic screenshots.
         """
-        # Check badge milestones
-        if self.badges_obtained >= 1 and 'first_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('first_gym_badge')
-        if self.badges_obtained >= 2 and 'second_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('second_gym_badge')
-        if self.badges_obtained >= 3 and 'third_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('third_gym_badge')
-        if self.badges_obtained >= 4 and 'fourth_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('fourth_gym_badge')
-        if self.badges_obtained >= 5 and 'fifth_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('fifth_gym_badge')
-        if self.badges_obtained >= 6 and 'sixth_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('sixth_gym_badge')
-        if self.badges_obtained >= 7 and 'seventh_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('seventh_gym_badge')
-        if self.badges_obtained >= 8 and 'eighth_gym_badge' not in self.milestones_achieved:
-            self._capture_milestone('eighth_gym_badge')
-        
-        # Check Pokemon catching milestones
-        if self.pokemon_caught_count >= 1 and 'first_pokemon_caught' not in self.milestones_achieved:
-            self._capture_milestone('first_pokemon_caught')
+        # Take periodic screenshots for monitoring (every 1000 steps)
+        if self.current_step % 1000 == 0 and self.current_step > 0:
+            self._capture_milestone(f'step_{self.current_step}')
     
     def _capture_milestone(self, milestone_key):
         """
-        Capture screenshot when milestone is achieved.
+        Capture screenshot for monitoring.
         """
-        if milestone_key in self.milestones_achieved:
-            return
-        
-        self.milestones_achieved.add(milestone_key)
-        
         # Get current screen (PyBoy 2.0 API) - convert to RGB
         screen_image = self.pyboy.screen.image.convert('RGB')
         screen = np.asarray(screen_image)
@@ -752,9 +501,7 @@ class PokemonRedEnv(gym.Env):
         img = Image.fromarray(screen)
         img.save(filepath)
         
-        milestone_desc = MILESTONES.get(milestone_key, milestone_key)
-        print(f"\nMILESTONE ACHIEVED: {milestone_desc}")
-        print(f"   Screenshot saved: {filepath}")
+        print(f"\nScreenshot saved: {filepath}")
         print(f"   Step: {self.current_step}")
         print(f"   Total Reward: {self.episode_rewards['total']:.2f}")
     
@@ -823,17 +570,20 @@ class MilestoneCallback(BaseCallback):
         self.episode_rewards = []
         self.episode_lengths = []
         
-        # Tracking for detailed reward analysis
+        # Real-time tracking for display
+        self.last_print_step = 0
+        self.recent_rewards = deque(maxlen=100)  # Last 100 episode rewards
+        self.recent_coords = deque(maxlen=100)  # Last 100 coord counts
+        
+        # ACTION TRACKING - Critical for debugging!
+        self.action_counts = [0] * 9  # Count of each action taken
+        self.recent_actions = deque(maxlen=1000)  # Last 1000 actions
+        self.action_names = ['DOWN', 'LEFT', 'RIGHT', 'UP', 'A', 'B', 'START', 'SELECT', 'WAIT']
+        
+        # Tracking for simplified reward analysis
         self.reward_components = {
             'exploration': [],
-            'battle_won': [],
-            'battle_engaged': [],
-            'damage_dealt': [],
-            'pokemon_caught': [],
-            'gym_badge': [],
-            'death_penalty': [],
-            'stuck_penalty': [],
-            'menu_penalty': []
+            'time_penalty': []
         }
         
         # Tracking for visualization
@@ -848,6 +598,19 @@ class MilestoneCallback(BaseCallback):
     
     def _on_step(self):
         """Called after each environment step."""
+        # Track actions taken in this step
+        if 'actions' in self.locals:
+            actions = self.locals['actions']
+            if hasattr(actions, '__iter__'):
+                for action in actions:
+                    action_int = int(action)
+                    self.action_counts[action_int] += 1
+                    self.recent_actions.append(action_int)
+            else:
+                action_int = int(actions)
+                self.action_counts[action_int] += 1
+                self.recent_actions.append(action_int)
+        
         # Save checkpoint periodically
         if self.n_calls % self.save_freq == 0:
             checkpoint_path = self.save_path / f"checkpoint_{self.n_calls}.zip"
@@ -855,10 +618,36 @@ class MilestoneCallback(BaseCallback):
             if self.verbose > 0:
                 print(f"\nCheckpoint saved: {checkpoint_path}")
         
+        # Print real-time reward stats every 50 steps
+        if self.n_calls - self.last_print_step >= 50:
+            self.last_print_step = self.n_calls
+            if len(self.recent_rewards) > 0:
+                mean_r = np.mean(self.recent_rewards)
+                max_r = np.max(self.recent_rewards)
+                min_r = np.min(self.recent_rewards)
+                mean_coords = np.mean(self.recent_coords) if len(self.recent_coords) > 0 else 0
+                
+                # Calculate action distribution from recent actions
+                recent_action_dist = ""
+                if len(self.recent_actions) > 0:
+                    from collections import Counter
+                    action_counter = Counter(self.recent_actions)
+                    total = len(self.recent_actions)
+                    # Show top 3 most common actions
+                    top_actions = action_counter.most_common(3)
+                    recent_action_dist = " | Actions: " + ", ".join([f"{self.action_names[a]}:{c*100/total:.0f}%" for a, c in top_actions])
+                
+                print(f"[Step {self.n_calls:6d}] Reward: {mean_r:+7.2f} (min:{min_r:+6.1f}, max:{max_r:+6.1f}) | Coords: {mean_coords:5.1f}{recent_action_dist}")
+        
         # Log reward components from the last step if available
         if hasattr(self.locals.get('infos', [{}])[0], '__iter__'):
             for info in self.locals.get('infos', []):
                 if 'episode' in info:
+                    # Track recent episode stats
+                    self.recent_rewards.append(info['episode']['r'])
+                    if 'coordinates_explored' in info:
+                        self.recent_coords.append(info['coordinates_explored'])
+                    
                     # Log episode rewards breakdown if available
                     if 'reward_breakdown' in info:
                         breakdown = info['reward_breakdown']
@@ -934,6 +723,18 @@ class MilestoneCallback(BaseCallback):
                 if len(coordinates_explored_total) > 0:
                     self.logger.record('game/coordinates_explored', np.mean(coordinates_explored_total))
             
+            # Log action distribution
+            if sum(self.action_counts) > 0:
+                for i, count in enumerate(self.action_counts):
+                    percentage = count / sum(self.action_counts) * 100
+                    self.logger.record(f'actions/{self.action_names[i]}', percentage)
+                
+                # Log action diversity (entropy)
+                total = sum(self.action_counts)
+                probs = [c / total for c in self.action_counts if c > 0]
+                action_entropy = -sum([p * np.log(p) for p in probs if p > 0])
+                self.logger.record('actions/entropy', action_entropy)
+            
             # Save best model
             if mean_reward > self.best_mean_reward:
                 self.best_mean_reward = mean_reward
@@ -982,16 +783,16 @@ ENV_CONFIG = {
 
 def main():
     """Main training function."""
-    # Training hyperparameters
-    NUM_ENVS = min(3, os.cpu_count())  # Use up to 24 parallel environments
-    TOTAL_TIMESTEPS = 50_000  # 100k steps
+    # Training hyperparameters - BALANCED LEARNING SETTINGS
+    NUM_ENVS = min(4, os.cpu_count())  # Parallel environments
+    TOTAL_TIMESTEPS = 100_000  # Learn game progression
     SAVE_FREQ = 5_000  # Save checkpoint every 5k steps
-    LEARNING_RATE = 3e-4
-    N_STEPS = 2048  # Steps per environment before update
-    BATCH_SIZE = 512
-    N_EPOCHS = 1
-    GAMMA = 0.999  # Discount factor
-    GAE_LAMBDA = 0.95
+    LEARNING_RATE = 0.001
+    N_STEPS = 256  # ⬆️ INCREASED from 64 - More stable updates every 256*4=1024 steps
+    BATCH_SIZE = 256  # Match N_STEPS for efficient learning
+    N_EPOCHS = 4  # ⬇️ REDUCED from 8 - Prevent overfitting to random exploration
+    GAMMA = 0.99  # ⬆️ INCREASED from 0.9 - Long-term strategy important for Pokemon
+    GAE_LAMBDA = 0.95  # ⬆️ INCREASED from 0.85 - Better advantage estimation
 
     print(f"\nTraining Configuration:")
     print(f"  Parallel Environments: {NUM_ENVS}")
@@ -999,6 +800,8 @@ def main():
     print(f"  Learning Rate: {LEARNING_RATE}")
     print(f"  Steps per Update: {N_STEPS}")
     print(f"  Batch Size: {BATCH_SIZE}")
+    print(f"  Gamma (discount): {GAMMA}")
+    print(f"  GAE Lambda: {GAE_LAMBDA}")
 
     # ============================================================================
     # MAIN TRAINING LOOP
@@ -1012,7 +815,7 @@ def main():
     env = SubprocVecEnv([make_env(i, ENV_CONFIG) for i in range(NUM_ENVS)])
 
     print("Initializing PPO model...")
-    # Create PPO model with CNN policy - EXPLORATION-FOCUSED HYPERPARAMETERS
+    # Create PPO model with CNN policy - BALANCED LEARNING HYPERPARAMETERS
     model = PPO(
         'CnnPolicy',
         env,
@@ -1022,14 +825,17 @@ def main():
         n_epochs=N_EPOCHS,
         gamma=GAMMA,
         gae_lambda=GAE_LAMBDA,
-        clip_range=0.3,  # ⬆️ Increased from 0.2 - allows bigger policy changes for exploration
+        clip_range=0.2,  # ⬇️ REDUCED from 0.4 - more conservative policy updates
         clip_range_vf=None,
-        ent_coef=0.05,  # ⬆️ Increased from 0.01 - MUCH stronger exploration bonus!
-        vf_coef=0.5,  # Value function coefficient
+        ent_coef=0.25,  # ⬆️ INCREASED from 0.15 - start higher to prevent collapse
+        # This allows early exploration but doesn't overwhelm game rewards
+        # 0.25 is moderate-high - enough exploration without entropy addiction
+        # Will be reduced over time via callback to allow strategy development
+        vf_coef=0.5,  # ⬆️ INCREASED from 0.3 - value function helps learn game strategy
         max_grad_norm=0.5,
         use_sde=False,
         sde_sample_freq=-1,
-        target_kl=None,
+        target_kl=None,  # Remove KL limit - allow reasonable policy changes
         tensorboard_log=str(SESSION_PATH / 'tensorboard'),
         policy_kwargs=dict(
             features_extractor_kwargs=dict(features_dim=512)
@@ -1042,11 +848,43 @@ def main():
     print(f"Model initialized. Device: {model.device}")
     print(f"Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
 
-    # Create callback
-    callback = MilestoneCallback(
+    # Create entropy scheduling callback to prevent policy collapse
+    class EntropyScheduler(BaseCallback):
+        """Gradually reduce entropy coefficient to allow strategy development while preventing collapse."""
+        
+        def __init__(self, initial_ent_coef=0.25, final_ent_coef=0.05, total_timesteps=100000):
+            super().__init__()
+            self.initial_ent_coef = initial_ent_coef
+            self.final_ent_coef = final_ent_coef
+            self.total_timesteps = total_timesteps
+            
+        def _on_step(self):
+            # Calculate current progress (0 to 1)
+            progress = min(self.num_timesteps / self.total_timesteps, 1.0)
+            
+            # Linear decay from initial to final entropy coefficient
+            current_ent_coef = self.initial_ent_coef - (self.initial_ent_coef - self.final_ent_coef) * progress
+            
+            # Update the model's entropy coefficient
+            self.model.ent_coef = current_ent_coef
+            
+            # Log the current entropy coefficient every 1000 steps
+            if self.num_timesteps % 1000 == 0:
+                self.logger.record('entropy_scheduler/ent_coef', current_ent_coef)
+                
+            return True
+
+    # Create callbacks
+    milestone_callback = MilestoneCallback(
         save_freq=SAVE_FREQ,
         save_path=SESSION_PATH / 'checkpoints',
         verbose=1
+    )
+    
+    entropy_callback = EntropyScheduler(
+        initial_ent_coef=0.25,
+        final_ent_coef=0.05, 
+        total_timesteps=TOTAL_TIMESTEPS
     )
 
     # Start training
@@ -1058,7 +896,7 @@ def main():
     try:
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS,
-            callback=callback,
+            callback=[milestone_callback, entropy_callback],  # Use both callbacks
             log_interval=1,  # Log every update for more frequent TensorBoard data
             progress_bar=True
         )
