@@ -650,9 +650,10 @@ class PokemonRedEnv(gym.Env):
         # Debug output for significant rewards
         significant_rewards = {k: v for k, v in state_scores.items() if abs(v) > 0.01}
         if significant_rewards:
-            reward_str = ", ".join([f"{k}:{v:.2f}" for k, v in significant_rewards.items()])
-            if any(abs(v) > 0.1 for v in significant_rewards.values()):  # Only print significant changes
-                print(f"  Rewards: {reward_str}")
+            # Only print when multiple rewards are active or very significant single rewards
+            if len(significant_rewards) > 1 or any(abs(v) > 1.0 for v in significant_rewards.values()):
+                reward_str = ", ".join([f"{k}:{v:.2f}" for k, v in significant_rewards.items()])
+                print(f"  Multi-reward: {reward_str}")
         
         return total_reward
     
