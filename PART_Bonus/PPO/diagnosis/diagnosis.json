@@ -1,0 +1,74 @@
+{
+  "model_path": "sessions\\pokemon_rl_20251004_222309\\final_model.zip",
+  "num_steps": 500,
+  "total_reward": 15.799999999999855,
+  "action_distribution": {
+    "DOWN": 96,
+    "LEFT": 112,
+    "RIGHT": 122,
+    "UP": 40,
+    "A": 0,
+    "B": 59,
+    "START": 0,
+    "SELECT": 69,
+    "WAIT": 2
+  },
+  "screen_diversity": {
+    "total": 500,
+    "unique": 103,
+    "ratio": 0.206
+  },
+  "position_exploration": {
+    "unique_positions": 1,
+    "most_common": [
+      [
+        [
+          0,
+          0,
+          0
+        ],
+        500
+      ]
+    ]
+  },
+  "reward_breakdown": {
+    "exploration": 1.0,
+    "battle_won": 0.0,
+    "battle_engaged": 0.0,
+    "damage_dealt": 0.0,
+    "pokemon_caught": 0.0,
+    "gym_badge": 0.0,
+    "death_penalty": 0.0,
+    "stuck_penalty": -0.1,
+    "menu_penalty": 0.0,
+    "total": 15.799999999999855
+  },
+  "tracker_statistics": {
+    "total_steps": 500,
+    "unique_screens": 103,
+    "loop_detections": 215,
+    "diversity_ratio": 0.206,
+    "most_common_screens": [
+      [
+        "4971708bb13768c6616483cf586c7a62",
+        66
+      ],
+      [
+        "daa891641651f25b48cd4fda66a46202",
+        44
+      ],
+      [
+        "dfcf60bd6b508cf847e3f9d114a2d127",
+        42
+      ],
+      [
+        "969464bb5dec00d57ef54c379e00c348",
+        42
+      ],
+      [
+        "d2c1b05ced7aee5e0f511c8878ab6f1a",
+        33
+      ]
+    ]
+  }
+}

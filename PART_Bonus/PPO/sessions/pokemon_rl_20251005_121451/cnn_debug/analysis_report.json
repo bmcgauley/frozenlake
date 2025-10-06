@@ -1,0 +1,55 @@
+{
+  "analysis_timestamp": "2025-10-05T15:39:59.435796",
+  "session_path": "sessions\\pokemon_rl_20251005_121451",
+  "total_frames_analyzed": 448,
+  "frame_statistics": {
+    "mean_intensity_across_time": 182.02824074074073,
+    "intensity_variation": 33.53099016748233,
+    "intensity_range": [
+      109.29513888888889,
+      237.31458333333333
+    ]
+  },
+  "observations": [
+    {
+      "frame_index": 0,
+      "mean_intensity": 209.52083333333334,
+      "std_intensity": 97.50363018526825,
+      "min_intensity": 0,
+      "max_intensity": 255,
+      "unique_values": 3
+    },
+    {
+      "frame_index": 23,
+      "mean_intensity": 228.79513888888889,
+      "std_intensity": 76.2451026021609,
+      "min_intensity": 0,
+      "max_intensity": 255,
+      "unique_values": 5
+    },
+    {
+      "frame_index": 47,
+      "mean_intensity": 194.3662037037037,
+      "std_intensity": 73.38722872061486,
+      "min_intensity": 0,
+      "max_intensity": 255,
+      "unique_values": 5
+    },
+    {
+      "frame_index": 70,
+      "mean_intensity": 192.33958333333334,
+      "std_intensity": 87.35434282814735,
+      "min_intensity": 0,
+      "max_intensity": 255,
+      "unique_values": 5
+    },
+    {
+      "frame_index": 94,
+      "mean_intensity": 192.0087962962963,
+      "std_intensity": 82.11382917111885,
+      "min_intensity": 0,
+      "max_intensity": 255,
+      "unique_values": 5
+    }
+  ]
+}

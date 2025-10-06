@@ -1,0 +1,14 @@
+{
+  "config": {
+    "rom_path": "PokemonRed.gb",
+    "headless": true,
+    "max_steps": 1000,
+    "save_path": "./test_session",
+    "save_screenshots": false
+  },
+  "timesteps": 5000,
+  "final_reward": 0.0,
+  "methodology": "simplified_screen_exploration",
+  "status": "test_passed",
+  "timestamp": "2025-10-05T00:18:52.817771"
+}
